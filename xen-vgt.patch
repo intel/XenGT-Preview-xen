@@ -1,0 +1,3175 @@
+diff --git a/tools/examples/xmexample.hvm b/tools/examples/xmexample.hvm
+index 96b6cc4..19358a4 100644
+--- a/tools/examples/xmexample.hvm
++++ b/tools/examples/xmexample.hvm
+@@ -350,6 +350,25 @@ tsc_mode=0
+ # like pci=['xx:xx.x'], it enables graphics passthrough, default=0 (disabled)
+ #gfx_passthru=0
+ 
++# Enable virtual graphics, default is disabled
++#vgt=0
++
++# The low gm size which is CPU visible, default is 64MB.
++#vgt_low_gm_sz=64
++
++# The high gm size which is CPU invisible, default is 448MB.
++#vgt_high_gm_sz=448
++
++# The number of the fence registers, default is 4.
++#vgt_fence_sz=4
++
++# The boolean variable(0|1) means if the vgt device should be the primary VGA.
++# The default is 0. For Windows vgt guest, we usually need to set it to 1 after
++# the gfx driver is installed.
++# If the user doesn't set this variable explicitly, the global setting of the
++# value in the vgt driver is used.
++#vgt_primary=0
++#
+ #-----------------------------------------------------------------------------
+ #   Configure PVSCSI devices:
+ #
+diff --git a/tools/firmware/Makefile b/tools/firmware/Makefile
+index aff8e56..2eb9e60 100644
+--- a/tools/firmware/Makefile
++++ b/tools/firmware/Makefile
+@@ -19,6 +19,7 @@ ovmf:
+ 
+ seabios-dir:
+ 	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_TAG) seabios-dir
++	patch -p1 < $(XEN_ROOT)/tools/firmware/xengt_seabios.patch
+ 	cp seabios-config seabios-dir/.config;
+ 
+ .PHONY: all
+diff --git a/tools/firmware/hvmloader/Makefile b/tools/firmware/hvmloader/Makefile
+index c6e7376..47365db 100644
+--- a/tools/firmware/hvmloader/Makefile
++++ b/tools/firmware/hvmloader/Makefile
+@@ -111,7 +111,12 @@ ifneq ($(STDVGA_ROM),)
+ 	echo "#ifdef ROM_INCLUDE_VGABIOS" >> $@.new
+ 	sh ./mkhex vgabios_stdvga $(STDVGA_ROM) >> $@.new
+ 	echo "#endif" >> $@.new
++
++	echo "#ifdef SEABIOS_INCLUDE_VGABIOS" >> $@.new
++	sh ./mkhex seabios_vgabios_stdvga $(STDVGA_ROM) >> $@.new
++	echo "#endif" >> $@.new
+ endif
++
+ ifneq ($(CIRRUSVGA_ROM),)
+ 	echo "#ifdef ROM_INCLUDE_VGABIOS" >> $@.new
+ 	sh ./mkhex vgabios_cirrusvga $(CIRRUSVGA_ROM) >> $@.new
+diff --git a/tools/firmware/hvmloader/config.h b/tools/firmware/hvmloader/config.h
+index 6641197..09ab9a9 100644
+--- a/tools/firmware/hvmloader/config.h
++++ b/tools/firmware/hvmloader/config.h
+@@ -53,7 +53,7 @@ extern struct bios_config ovmf_config;
+ #define PCI_ISA_IRQ_MASK    0x0c20U /* ISA IRQs 5,10,11 are PCI connected */
+ 
+ /* MMIO hole: Hardcoded defaults, which can be dynamically expanded. */
+-#define PCI_MEM_START       0xf0000000
++#define PCI_MEM_START       0xc0000000
+ #define PCI_MEM_END         0xfc000000
+ 
+ extern unsigned long pci_mem_start, pci_mem_end;
+diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
+index 627e8cb..be80f9d 100644
+--- a/tools/firmware/hvmloader/pci.c
++++ b/tools/firmware/hvmloader/pci.c
+@@ -24,6 +24,7 @@
+ #include "hypercall.h"
+ #include "config.h"
+ #include "pci_regs.h"
++#include "vgt_devtable.h"
+ 
+ #include <xen/memory.h>
+ #include <xen/hvm/ioreq.h>
+@@ -111,30 +112,53 @@ void pci_setup(void)
+         ASSERT((devfn != PCI_ISA_DEVFN) ||
+                ((vendor_id == 0x8086) && (device_id == 0x7000)));
+ 
++        printf("Detect %x.%x devfn, with class: %x\n", devfn>>3, devfn&7, class);
+         switch ( class )
+         {
+         case 0x0300:
+             /* If emulated VGA is found, preserve it as primary VGA. */
+             if ( (vendor_id == 0x1234) && (device_id == 0x1111) )
+             {
++                printf("Detect emulated stdvga\n");
+                 vga_devfn = devfn;
+                 virtual_vga = VGA_std;
+             }
+             else if ( (vendor_id == 0x1013) && (device_id == 0xb8) )
+             {
++                printf("Detect emulated cirrus vga\n");
+                 vga_devfn = devfn;
+                 virtual_vga = VGA_cirrus;
+             }
+             else if ( virtual_vga == VGA_none )
+             {
+-                vga_devfn = devfn;
+-                virtual_vga = VGA_pt;
++                printf("No emulated vga\n");
++                if ( (vendor_id == 0x8086) && 
++                      (_is_sandybridge(device_id) || _is_ivybridge(device_id)
++                       || _is_haswell(device_id) )
++                    )
++                {
++                   /*
++                    * Found VGT device, and use standard VGA bios.
++                    * (may be overwritten by CirrusLogic)
++                    * TODO: Revisit to co-exist with VTd GEN HW.
++                    */
++                    printf("Found VGT\n");
++                    vga_devfn = devfn;
++                    virtual_vga = VGA_std;
++                }
++                else
++                {
++                    printf("Found VTD\n");
++                    vga_devfn = devfn;
++                    virtual_vga = VGA_pt;
++                }
++
+                 if ( vendor_id == 0x8086 )
+                 {
+-                    igd_opregion_pgbase = mem_hole_alloc(IGD_OPREGION_PAGES);
++                    igd_opregion_pgbase = mem_hole_alloc(2);
+                     /*
+                      * Write the the OpRegion offset to give the opregion
+-                     * address to the device model. The device model will trap 
++                     * address to the device model. The device model will trap
+                      * and map the OpRegion at the give address.
+                      */
+                     pci_writel(vga_devfn, PCI_INTEL_OPREGION,
+@@ -272,6 +296,13 @@ void pci_setup(void)
+             unsigned int,
+             hvm_info->low_mem_pgend - (pci_mem_start >> PAGE_SHIFT),
+             (1u << 16) - 1);
++
++        /* This is a temporary check and will be removed once upstream Xen
++         * fix the issue "QEMU hardcodes PCI MMIO base.
++         */
++        printf("can not find a big enough MMIO hole!!!\n");
++        BUG();
++
+         if ( hvm_info->high_mem_pgend == 0 )
+             hvm_info->high_mem_pgend = 1ull << (32 - PAGE_SHIFT);
+         hvm_info->low_mem_pgend -= nr_pages;
+diff --git a/tools/firmware/hvmloader/seabios.c b/tools/firmware/hvmloader/seabios.c
+index f17e67b..98fb9af 100644
+--- a/tools/firmware/hvmloader/seabios.c
++++ b/tools/firmware/hvmloader/seabios.c
+@@ -29,6 +29,7 @@
+ #include "acpi/acpi2_0.h"
+ 
+ #define ROM_INCLUDE_SEABIOS
++#define SEABIOS_INCLUDE_VGABIOS
+ #include "roms.inc"
+ 
+ extern unsigned char dsdt_anycpu_qemu_xen[];
+@@ -135,6 +136,18 @@ static void seabios_setup_e820(void)
+ 
+ //BUILD_BUG_ON(sizeof(seabios) > (0x00100000U - SEABIOS_PHYSICAL_ADDRESS));
+ 
++#ifdef SEABIOS_INCLUDE_VGABIOS
++static void seabios_load_roms(void)
++{
++	if (virtual_vga != VGA_std)
++		return;
++
++	printf("Loading Standard VGABIOS ...\n");
++        memcpy((void *)VGABIOS_PHYSICAL_ADDRESS,
++               seabios_vgabios_stdvga, sizeof(seabios_vgabios_stdvga));
++}
++#endif
++
+ struct bios_config seabios_config = {
+     .name = "SeaBIOS",
+ 
+@@ -143,7 +156,11 @@ struct bios_config seabios_config = {
+ 
+     .bios_address = SEABIOS_PHYSICAL_ADDRESS,
+ 
++#ifdef SEABIOS_INCLUDE_VGABIOS
++    .load_roms = seabios_load_roms,
++#else
+     .load_roms = NULL,
++#endif
+ 
+     .bios_load = NULL,
+ 
+diff --git a/tools/firmware/hvmloader/vgt_devtable.h b/tools/firmware/hvmloader/vgt_devtable.h
+new file mode 100644
+index 0000000..222ee64
+--- /dev/null
++++ b/tools/firmware/hvmloader/vgt_devtable.h
+@@ -0,0 +1,113 @@
++/*
++ * Copyright (c) 2012-2013, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef _VGT_DEVTABLE_H
++#define _VGT_DEVTABLE_H
++
++static inline int _is_sandybridge(int devid)
++{
++    int ret = 0;
++
++    switch (devid) {
++	case 0x0102:
++	case 0x0112:
++	case 0x0122:
++	case 0x0106:
++	case 0x0116:
++	case 0x0126:
++	case 0x010A:
++            ret = 1;
++            break;
++        default:
++            break;
++    }
++    return ret;
++}
++
++static inline int _is_ivybridge(int devid)
++{
++    int ret = 0;
++
++    switch (devid) {
++	case 0x0156:
++	case 0x0166:
++	case 0x0152:
++	case 0x0162:
++	case 0x015a:
++	case 0x016a:
++            ret = 1;
++            break;
++        default:
++            break;
++    }
++    return ret;
++}
++
++static inline int _is_haswell(int devid)
++{
++    int ret = 0;
++
++    switch (devid) {
++	case 0x0400:
++	case 0x0402:
++	case 0x0404:
++	case 0x0406:
++	case 0x0408:
++	case 0x040a:
++	case 0x0412:
++	case 0x0416:
++	case 0x041a:
++	case 0x0422:
++	case 0x0426:
++	case 0x042a:
++	case 0x0a02:
++	case 0x0a06:
++	case 0x0a0a:
++	case 0x0a12:
++	case 0x0a16:
++	case 0x0a1a:
++	case 0x0a22:
++	case 0x0a26:
++	case 0x0a2a:
++	case 0x0c02:
++	case 0x0c04:
++	case 0x0c06:
++	case 0x0c0a:
++	case 0x0c12:
++	case 0x0c16:
++	case 0x0c1a:
++	case 0x0c22:
++	case 0x0c26:
++	case 0x0c2a:
++	case 0x0d12:
++	case 0x0d16:
++	case 0x0d1a:
++	case 0x0d22:
++	case 0x0d26:
++	case 0x0d2a:
++	case 0x0d32:
++	case 0x0d36:
++	case 0x0d3a:
++            ret = 1;
++            break;
++        default:
++            break;
++    }
++    return ret;
++}
++
++#endif  /* _VGT_DEVTABLE_H */
+diff --git a/tools/firmware/vgabios/vgabios.c b/tools/firmware/vgabios/vgabios.c
+index a9dbe00..58110c5 100644
+--- a/tools/firmware/vgabios/vgabios.c
++++ b/tools/firmware/vgabios/vgabios.c
+@@ -149,6 +149,13 @@ vgabios_entry_point:
+            
+   jmp vgabios_init_func
+ 
++#define VGT
++/*
++ * GEN Windows driver assume the identifying string
++ * to be located from the VBIOS offset 6.
++ * Remove the following bytes to make Windows happy for VGT.
++ */
++#ifndef VGT
+ #ifdef PCIBIOS
+ .org 0x18
+ .word vgabios_pci_data
+@@ -158,6 +165,7 @@ vgabios_entry_point:
+ .org 0x1e
+ .ascii  "IBM"
+ .byte   0x00
++#endif  /* VGT */
+ 
+ vgabios_name:
+ .ascii	"Plex86/Bochs VGABios"
+diff --git a/tools/firmware/xengt_seabios.patch b/tools/firmware/xengt_seabios.patch
+new file mode 100644
+index 0000000..d917519
+--- /dev/null
++++ b/tools/firmware/xengt_seabios.patch
+@@ -0,0 +1,12 @@
++--- a/seabios-dir/src/optionroms.c
+++++ b/seabios-dir/src/optionroms.c
++@@ -478,7 +478,8 @@ vga_setup(void)
++     S3ResumeVgaInit = romfile_loadint("etc/s3-resume-vga-init", 0);
++     ScreenAndDebug = romfile_loadint("etc/screen-and-debug", 1);
++
++-    if (CONFIG_OPTIONROMS_DEPLOYED) {
+++    if (CONFIG_OPTIONROMS_DEPLOYED ||
+++       ((*(u16 *)BUILD_ROM_START) == 0xaa55)) {
++         // Option roms are already deployed on the system.
++         init_optionrom((void*)BUILD_ROM_START, 0, 1);
++     } else {
+diff --git a/tools/libxl/libxl.c b/tools/libxl/libxl.c
+index 3236aa9..4322fbd 100644
+--- a/tools/libxl/libxl.c
++++ b/tools/libxl/libxl.c
+@@ -1284,6 +1284,29 @@ static void domain_destroy_callback(libxl__egc *egc,
+ static void destroy_finish_check(libxl__egc *egc,
+                                  libxl__domain_destroy_state *dds);
+ 
++// We don't care the return value:
++// 1) the guest may not be a VGT guest;
++// 2) normally when a VGT guest shutdown, the ioemu has already tried to
++// destroy the vgt instance and we shouldn't come here by "xl dest dom_id".
++// 3) we come here because the ioemu didn't destroy the vgt instance
++// successfully(e.g., ioemu exits abnormally) or we want to kill the guest by
++// force while it's running. In this case, we still try our best to destroy
++// the vgt instance.
++static void destroy_vgt_instance(int domid)
++{
++    const char *path = "/sys/kernel/vgt/control/create_vgt_instance";
++    FILE *vgt_file;
++
++    if (domid <= 0)
++        return;
++
++    if ((vgt_file = fopen(path, "w")) == NULL)
++        return;
++
++    (void)fprintf(vgt_file, "%d\n", -domid);
++    (void)fclose(vgt_file);
++}
++
+ void libxl__domain_destroy(libxl__egc *egc, libxl__domain_destroy_state *dds)
+ {
+     STATE_AO_GC(dds->ao);
+@@ -1466,6 +1489,8 @@ static void devices_destroy_cb(libxl__egc *egc,
+ 
+     libxl__userdata_destroyall(gc, domid);
+ 
++    destroy_vgt_instance(domid);
++
+     rc = xc_domain_destroy(ctx->xch, domid);
+     if (rc < 0) {
+         LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_domain_destroy failed for %d", domid);
+diff --git a/tools/libxl/libxl_create.c b/tools/libxl/libxl_create.c
+index 0c32d0b..bf29699 100644
+--- a/tools/libxl/libxl_create.c
++++ b/tools/libxl/libxl_create.c
+@@ -275,7 +275,7 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
+         }
+ 
+         libxl_defbool_setdefault(&b_info->u.hvm.nographic, false);
+-
++        libxl_defbool_setdefault(&b_info->u.hvm.vgt, false);
+         libxl_defbool_setdefault(&b_info->u.hvm.gfx_passthru, false);
+ 
+         break;
+diff --git a/tools/libxl/libxl_dm.c b/tools/libxl/libxl_dm.c
+index 7e54c02..684a086 100644
+--- a/tools/libxl/libxl_dm.c
++++ b/tools/libxl/libxl_dm.c
+@@ -185,12 +185,32 @@ static char ** libxl__build_device_model_args_old(libxl__gc *gc,
+                     NULL);
+         }
+ 
+-        switch (b_info->u.hvm.vga.kind) {
+-        case LIBXL_VGA_INTERFACE_TYPE_STD:
+-            flexarray_append(dm_args, "-std-vga");
+-            break;
+-        case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
+-            break;
++        if (libxl_defbool_val(b_info->u.hvm.vgt)) {
++            flexarray_vappend(dm_args, "-vga", "xengt", NULL);
++            if (b_info->u.hvm.vgt_low_gm_sz) {
++                flexarray_vappend(dm_args, "-vgt_low_gm_sz",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_low_gm_sz), NULL);
++            }
++            if (b_info->u.hvm.vgt_high_gm_sz) {
++                flexarray_vappend(dm_args, "-vgt_high_gm_sz",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_high_gm_sz), NULL);
++            }
++            if (b_info->u.hvm.vgt_fence_sz) {
++                flexarray_vappend(dm_args, "-vgt_fence_sz",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_fence_sz), NULL);
++            }
++            if (b_info->u.hvm.vgt_primary != -1) {
++                flexarray_vappend(dm_args, "-vgt_primary",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_primary), NULL);
++            }
++        } else {
++            switch (b_info->u.hvm.vga.kind) {
++            case LIBXL_VGA_INTERFACE_TYPE_STD:
++                flexarray_append(dm_args, "-std-vga");
++                break;
++            case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
++                break;
++            }
+         }
+ 
+         if (b_info->u.hvm.boot) {
+@@ -465,19 +485,40 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
+             flexarray_append(dm_args, spiceoptions);
+         }
+ 
+-        switch (b_info->u.hvm.vga.kind) {
+-        case LIBXL_VGA_INTERFACE_TYPE_STD:
+-            flexarray_vappend(dm_args, "-vga", "std", NULL);
+-            break;
+-        case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
+-            flexarray_vappend(dm_args, "-vga", "cirrus", NULL);
+-            if (b_info->video_memkb) {
+-                flexarray_vappend(dm_args, "-global",
+-                    GCSPRINTF("vga.vram_size_mb=%d",
+-                    libxl__sizekb_to_mb(b_info->video_memkb)), NULL);
++	/* TODO: some vga options are exclusive */
++	if (libxl_defbool_val(b_info->u.hvm.vgt)) {
++		flexarray_vappend(dm_args, "-vga", "xengt", NULL);
++            if (b_info->u.hvm.vgt_low_gm_sz) {
++                flexarray_vappend(dm_args, "-vgt_low_gm_sz",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_low_gm_sz), NULL);
++		}
++            if (b_info->u.hvm.vgt_high_gm_sz) {
++                flexarray_vappend(dm_args, "-vgt_high_gm_sz",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_high_gm_sz), NULL);
++		}
++		if (b_info->u.hvm.vgt_fence_sz) {
++			flexarray_vappend(dm_args, "-vgt_fence_sz",
++					libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_fence_sz), NULL);
++		}
++            if (b_info->u.hvm.vgt_primary != -1) {
++                flexarray_vappend(dm_args, "-vgt_primary",
++                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_primary), NULL);
+             }
+-            break;
+-        }
++	} else {
++		switch (b_info->u.hvm.vga.kind) {
++			case LIBXL_VGA_INTERFACE_TYPE_STD:
++				flexarray_vappend(dm_args, "-vga", "std", NULL);
++				break;
++			case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
++				flexarray_vappend(dm_args, "-vga", "cirrus", NULL);
++				if (b_info->video_memkb) {
++					flexarray_vappend(dm_args, "-global",
++							GCSPRINTF("vga.vram_size_mb=%d",
++								libxl__sizekb_to_mb(b_info->video_memkb)), NULL);
++				}
++				break;
++		}
++	}
+ 
+         if (b_info->u.hvm.boot) {
+             flexarray_vappend(dm_args, "-boot",
+@@ -553,9 +594,6 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
+             flexarray_append(dm_args, "-net");
+             flexarray_append(dm_args, "none");
+         }
+-        if (libxl_defbool_val(b_info->u.hvm.gfx_passthru)) {
+-            flexarray_append(dm_args, "-gfx_passthru");
+-        }
+     } else {
+         if (!sdl && !vnc) {
+             flexarray_append(dm_args, "-nographic");
+diff --git a/tools/libxl/libxl_pci.c b/tools/libxl/libxl_pci.c
+index 88bf91e..5eb6196 100644
+--- a/tools/libxl/libxl_pci.c
++++ b/tools/libxl/libxl_pci.c
+@@ -1070,7 +1070,11 @@ int libxl__device_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcide
+         goto out;
+     }
+ 
+-    libxl__device_pci_reset(gc, pcidev->domain, pcidev->bus, pcidev->dev, pcidev->func);
++    if (pcidev->bus == 0 && pcidev-> dev == 2 && pcidev->func == 0) {
++        printf("xuanhua: %s, %d: for HVM we do not reset pci device (00:02:0)\n", __func__, __LINE__);
++        fflush(stdout);
++    } else
++        libxl__device_pci_reset(gc, pcidev->domain, pcidev->bus, pcidev->dev, pcidev->func);
+ 
+     stubdomid = libxl_get_stubdom_id(ctx, domid);
+     if (stubdomid != 0) {
+diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
+index d218a2d..11a7a59 100644
+--- a/tools/libxl/libxl_types.idl
++++ b/tools/libxl/libxl_types.idl
+@@ -23,6 +23,7 @@ libxl_hwcap = Builtin("hwcap", passby=PASS_BY_REFERENCE)
+ #
+ 
+ MemKB = UInt(64, init_val = "LIBXL_MEMKB_DEFAULT")
++VgtInt = UInt(32, init_val = "0UL")
+ 
+ #
+ # Constants / Enumerations
+@@ -314,12 +315,17 @@ libxl_domain_build_info = Struct("domain_build_info",[
+                                        ("acpi_firmware",    string),
+                                        ("nographic",        libxl_defbool),
+                                        ("vga",              libxl_vga_interface_info),
++                                       ("vgt",              libxl_defbool),
++                                       ("vgt_low_gm_sz",  VgtInt),
++                                       ("vgt_high_gm_sz",        VgtInt),
++                                       ("vgt_fence_sz",     VgtInt),
++                                       ("vgt_primary",     VgtInt),
+                                        ("vnc",              libxl_vnc_info),
+                                        # keyboard layout, default is en-us keyboard
+                                        ("keymap",           string),
+                                        ("sdl",              libxl_sdl_info),
+                                        ("spice",            libxl_spice_info),
+-                                       
++                                      
+                                        ("gfx_passthru",     libxl_defbool),
+                                        
+                                        ("serial",           string),
+diff --git a/tools/libxl/xl_cmdimpl.c b/tools/libxl/xl_cmdimpl.c
+index 8a478ba..f428160 100644
+--- a/tools/libxl/xl_cmdimpl.c
++++ b/tools/libxl/xl_cmdimpl.c
+@@ -1464,6 +1464,17 @@ skip_vfb:
+             b_info->u.hvm.vga.kind = l ? LIBXL_VGA_INTERFACE_TYPE_STD :
+                                          LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
+ 
++        xlu_cfg_get_defbool(config, "vgt", &b_info->u.hvm.vgt, 0);
++        if(!xlu_cfg_get_long(config, "vgt_low_gm_sz", &l, 0))
++            b_info->u.hvm.vgt_low_gm_sz = l;
++        if(!xlu_cfg_get_long(config, "vgt_high_gm_sz", &l, 0))
++            b_info->u.hvm.vgt_high_gm_sz = l;
++        if(!xlu_cfg_get_long(config, "vgt_fence_sz", &l, 0))
++            b_info->u.hvm.vgt_fence_sz = l;
++        if(!xlu_cfg_get_long(config, "vgt_primary", &l, 0))
++            b_info->u.hvm.vgt_primary = l;
++        else
++            b_info->u.hvm.vgt_primary = -1; /* not specified */
+         xlu_cfg_get_defbool(config, "vnc", &b_info->u.hvm.vnc.enable, 0);
+         xlu_cfg_replace_string (config, "vnclisten",
+                                 &b_info->u.hvm.vnc.listen, 0);
+diff --git a/tools/libxl/xl_sxp.c b/tools/libxl/xl_sxp.c
+index a16a025..345c6d0 100644
+--- a/tools/libxl/xl_sxp.c
++++ b/tools/libxl/xl_sxp.c
+@@ -113,6 +113,8 @@ void printf_info_sexp(int domid, libxl_domain_config *d_config)
+         printf("\t\t\t(stdvga %s)\n", b_info->u.hvm.vga.kind ==
+                                       LIBXL_VGA_INTERFACE_TYPE_STD ?
+                                       "True" : "False");
++        printf("\t\t\t(vgt %s)\n",
++               libxl_defbool_to_string(b_info->u.hvm.vgt));
+         printf("\t\t\t(vnc %s)\n",
+                libxl_defbool_to_string(b_info->u.hvm.vnc.enable));
+         printf("\t\t\t(vnclisten %s)\n", b_info->u.hvm.vnc.listen);
+diff --git a/tools/tests/Makefile b/tools/tests/Makefile
+index adeb120..f94bbde 100644
+--- a/tools/tests/Makefile
++++ b/tools/tests/Makefile
+@@ -5,7 +5,7 @@ CFLAGS  += $(CFLAGS_libxenctrl)
+ LDLIBS += $(LDLIBS_libxenctrl)
+ 
+ SUBDIRS-y :=
+-SUBDIRS-$(CONFIG_X86) += mce-test
++#SUBDIRS-$(CONFIG_X86) += mce-test
+ SUBDIRS-y += mem-sharing
+ ifeq ($(XEN_TARGET_ARCH),__fixme__)
+ SUBDIRS-y += regression
+diff --git a/xen/arch/x86/Makefile b/xen/arch/x86/Makefile
+index d502bdf..e8a3c4b 100644
+--- a/xen/arch/x86/Makefile
++++ b/xen/arch/x86/Makefile
+@@ -58,6 +58,7 @@ obj-y += crash.o
+ obj-y += tboot.o
+ obj-y += hpet.o
+ obj-y += xstate.o
++obj-y += vgt.o
+ 
+ obj-$(crash_debug) += gdbstub.o
+ 
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 52c9040..9d32379 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -60,6 +60,7 @@
+ #include <xen/numa.h>
+ #include <xen/iommu.h>
+ #include <compat/vcpu.h>
++#include <asm/vgt.h>
+ 
+ DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
+ DEFINE_PER_CPU(unsigned long, cr4);
+@@ -469,6 +470,8 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
+         (domcr_flags & DOMCRF_hap);
+     d->arch.hvm_domain.mem_sharing_enabled = 0;
+ 
++    d->arch.hvm_domain.vgt_enabled = 0;
++
+     d->arch.s3_integrity = !!(domcr_flags & DOMCRF_s3_integrity);
+ 
+     INIT_LIST_HEAD(&d->arch.pdev_list);
+@@ -532,6 +535,8 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
+ 
+         d->arch.ioport_caps = 
+             rangeset_new(d, "I/O Ports", RANGESETF_prettyprint_hex);
++        d->arch.ioport_forwarding_caps =
++            rangeset_new(d, "I/O Ports Self-forwarding", RANGESETF_prettyprint_hex);
+         rc = -ENOMEM;
+         if ( d->arch.ioport_caps == NULL )
+             goto fail;
+@@ -1020,6 +1025,145 @@ arch_do_vcpu_op(
+         break;
+     }
+ 
++    case VCPUOP_request_io_emulation:
++    {
++        struct vcpu_emul_ioreq ioreq;
++
++        rc = -EFAULT;
++	if (dom0 != v->domain)	/* only for dom0 */
++		break;
++        if ( copy_from_guest(&ioreq, arg, 1) )
++            break;
++
++        rc = -EINVAL;
++        if ( !hypercall_io_emulation(v, &ioreq) )
++            break;
++
++        rc = -EFAULT;
++        if ( copy_to_guest(arg, &ioreq, 1) )
++            break;
++        rc = 0;
++        break;
++    }
++
++    case VCPUOP_start_io_forward:
++    {
++        struct vcpu_io_forwarding_request req;
++        int query = 0;
++        unsigned long s, e;
++        int i;
++        rc = -EFAULT;
++
++        if ( dom0 != v->domain )  /* only for dom0 */
++            break;
++
++        if ( copy_from_guest(&req, arg, 1) )
++            break;
++
++        printk("vGT: start I/O PIO %d s %lx e %lx\n",
++            req.nr_pio_frags,
++            (long)req.pio_frags[0].s,
++            (long)req.pio_frags[0].e);
++        printk("vGT: start I/O MMIO %d s %lx e %lx\n",
++            req.nr_mmio_frags,
++            (long)req.mmio_frags[0].s,
++            (long)req.mmio_frags[0].e);
++
++        if ( req.nr_pio_frags == -1 )
++        {
++                struct rangeset *r = v->domain->arch.ioport_forwarding_caps;
++                void *y = first_range_ex(r);
++                for ( i = 0; y != NULL && i < MAX_TRAP_FRAGS; i++ )
++                {
++                        y = get_range(r, y, &s, &e);
++                        req.pio_frags[i].s = s;
++                        req.pio_frags[i].e = e;
++                }
++                req.nr_pio_frags = i;
++                query = 1;
++                printk("VGT: PIO retrieves configurations:"
++                        " frags %d s %lx e %lx\n",
++                        req.nr_pio_frags,
++                        req.pio_frags[0].s,
++                        req.pio_frags[0].e);
++
++        } else {
++            for ( i = 0; i < req.nr_pio_frags; i++ )
++            {
++                if ( 0 != ioports_permit_forwarding(v->domain,
++                        req.pio_frags[i].s,
++                        req.pio_frags[i].e) )
++                {
++                    printk("VGT: PIO set trap region failed %d\n", i);
++                    break;
++                }
++            }
++        }
++
++        if ( req.nr_mmio_frags == -1 )
++        {
++            struct rangeset *r = v->domain->iomem_forward_caps;
++            void *y = first_range_ex(r);
++
++            for ( i = 0; y != NULL && i < MAX_TRAP_FRAGS; i++ )
++            {
++                y = get_range(r, y, &s, &e);
++                req.mmio_frags[i].s = s << PAGE_SHIFT;
++                req.mmio_frags[i].e = e << PAGE_SHIFT;
++            }
++            req.nr_mmio_frags = i;
++            query = 1;
++            printk("VGT: MMIO retrieves configurations:"
++                    " frags %d s %lx e %lx\n",
++                    req.nr_mmio_frags,
++                    req.mmio_frags[0].s,
++                    req.mmio_frags[0].e);
++
++        } else {
++            for ( i = 0; i < req.nr_mmio_frags; i++ )
++            {
++                if ( (req.mmio_frags[i].s & ~PAGE_MASK) != 0 ||
++                    (req.mmio_frags[i].e & ~PAGE_MASK) != 0)
++                {
++                    printk("VGT: MMIO frags %d not page aligned\n", i);
++                    break;
++                }
++
++                if ( vgt_set_mmio_trap(v->domain,
++                    req.mmio_frags[i].s >> PAGE_SHIFT,
++                    req.mmio_frags[i].e >> PAGE_SHIFT) != 0 )
++                    break;
++            }
++        }
++
++        if ( query && copy_to_guest(arg, &req, 1) )
++                break;
++
++        rc = 0;
++        break;
++    }
++
++    case VCPUOP_get_sysdata:
++    {
++        struct vcpu_sysdata_request req;
++
++        rc = -EFAULT;
++	if (dom0 != v->domain)	/* only for dom0 */
++		break;
++        if ( copy_from_guest(&req, arg, 1) )
++            break;
++
++        rc = -EINVAL;
++        if ( !hypercall_get_sysdata(v, &req) )
++            break;
++
++        rc = -EFAULT;
++        if ( copy_to_guest(arg, &req, 1) )
++            break;
++        rc = 0;
++        break;
++    }
++
+     default:
+         rc = -ENOSYS;
+         break;
+diff --git a/xen/arch/x86/domain_build.c b/xen/arch/x86/domain_build.c
+index 03fe845..2e83ea2 100644
+--- a/xen/arch/x86/domain_build.c
++++ b/xen/arch/x86/domain_build.c
+@@ -35,6 +35,7 @@
+ #include <asm/setup.h>
+ #include <asm/bzimage.h> /* for bzimage_parse */
+ #include <asm/io_apic.h>
++#include <asm/vgt.h>
+ 
+ #include <public/version.h>
+ 
+diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
+index c2a04c4..482b130 100644
+--- a/xen/arch/x86/domctl.c
++++ b/xen/arch/x86/domctl.c
+@@ -641,7 +641,8 @@ long arch_do_domctl(
+         if ( ret )
+             break;
+ 
+-        if ( add )
++        ret=0;
++        if ( add == DPCI_ADD_MAPPING )
+         {
+             printk(XENLOG_G_INFO
+                    "memory_map:add: dom%d gfn=%lx mfn=%lx nr=%lx\n",
+diff --git a/xen/arch/x86/hvm/Makefile b/xen/arch/x86/hvm/Makefile
+index eea5555..765a09f 100644
+--- a/xen/arch/x86/hvm/Makefile
++++ b/xen/arch/x86/hvm/Makefile
+@@ -22,4 +22,5 @@ obj-y += vlapic.o
+ obj-y += vmsi.o
+ obj-y += vpic.o
+ obj-y += vpt.o
+-obj-y += vpmu.o
+\ No newline at end of file
++obj-y += vpmu.o
++obj-y += vgt.o
+diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
+index 9bfba48..259d5bb 100644
+--- a/xen/arch/x86/hvm/emulate.c
++++ b/xen/arch/x86/hvm/emulate.c
+@@ -181,6 +181,7 @@ static int hvmemul_do_io(
+     p->count = *reps;
+     p->df = df;
+     p->data = value;
++    p->is_vgt = 0;
+ 
+     if ( dir == IOREQ_WRITE )
+         hvmtrace_io_assist(is_mmio, p);
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 43b6d05..6c79e3d 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -59,6 +59,7 @@
+ #include <asm/hvm/nestedhvm.h>
+ #include <asm/mtrr.h>
+ #include <asm/apic.h>
++#include <asm/vgt.h>
+ #include <public/sched.h>
+ #include <public/hvm/ioreq.h>
+ #include <public/version.h>
+@@ -357,7 +358,8 @@ void hvm_do_resume(struct vcpu *v)
+             break;
+         case STATE_IOREQ_READY:  /* IOREQ_{READY,INPROCESS} -> IORESP_READY */
+         case STATE_IOREQ_INPROCESS:
+-            wait_on_xen_event_channel(v->arch.hvm_vcpu.xen_port,
++            wait_on_xen_event_channel(p->is_vgt ? v->arch.hvm_vcpu.vgt_port :
++                                       v->arch.hvm_vcpu.xen_port,
+                                       (p->state != STATE_IOREQ_READY) &&
+                                       (p->state != STATE_IOREQ_INPROCESS));
+             break;
+@@ -524,6 +526,7 @@ int hvm_domain_initialise(struct domain *d)
+     spin_lock_init(&d->arch.hvm_domain.pbuf_lock);
+     spin_lock_init(&d->arch.hvm_domain.irq_lock);
+     spin_lock_init(&d->arch.hvm_domain.uc_lock);
++    spin_lock_init(&d->arch.hvm_domain.vgt_wp_hash_lock);
+ 
+     INIT_LIST_HEAD(&d->arch.hvm_domain.msixtbl_list);
+     spin_lock_init(&d->arch.hvm_domain.msixtbl_list_lock);
+@@ -612,6 +615,7 @@ void hvm_domain_destroy(struct domain *d)
+     rtc_deinit(d);
+     stdvga_deinit(d);
+     vioapic_deinit(d);
++    vgt_hvm_deinit(d);
+     hvm_destroy_cacheattr_region_list(d);
+ }
+ 
+@@ -1092,6 +1096,14 @@ int hvm_vcpu_initialise(struct vcpu *v)
+     /* Register ioreq event channel. */
+     v->arch.hvm_vcpu.xen_port = rc;
+ 
++    /* Create ioreq vgt event channel. */
++    rc = alloc_unbound_xen_event_channel(v, 0, NULL);
++    if ( rc < 0 )
++        goto fail4;
++
++    /* Register ioreq vgt event channel. */
++    v->arch.hvm_vcpu.vgt_port = rc;
++
+     if ( v->vcpu_id == 0 )
+     {
+         /* Create bufioreq event channel. */
+@@ -1103,7 +1115,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
+ 
+     spin_lock(&d->arch.hvm_domain.ioreq.lock);
+     if ( d->arch.hvm_domain.ioreq.va != NULL )
++	{
+         get_ioreq(v)->vp_eport = v->arch.hvm_vcpu.xen_port;
++        get_ioreq(v)->vgt_eport = v->arch.hvm_vcpu.vgt_port;
++	}
+     spin_unlock(&d->arch.hvm_domain.ioreq.lock);
+ 
+     spin_lock_init(&v->arch.hvm_vcpu.tm_lock);
+@@ -1197,6 +1212,7 @@ void hvm_vcpu_down(struct vcpu *v)
+ bool_t hvm_send_assist_req(struct vcpu *v)
+ {
+     ioreq_t *p;
++    int port;
+ 
+     if ( unlikely(!vcpu_start_shutdown_deferral(v)) )
+         return 0; /* implicitly bins the i/o operation */
+@@ -1210,14 +1226,16 @@ bool_t hvm_send_assist_req(struct vcpu *v)
+         return 0;
+     }
+ 
+-    prepare_wait_on_xen_event_channel(v->arch.hvm_vcpu.xen_port);
++    port = p->is_vgt ? v->arch.hvm_vcpu.vgt_port : v->arch.hvm_vcpu.xen_port;
++
++    prepare_wait_on_xen_event_channel(port);
+ 
+     /*
+      * Following happens /after/ blocking and setting up ioreq contents.
+      * prepare_wait_on_xen_event_channel() is an implicit barrier.
+      */
+     p->state = STATE_IOREQ_READY;
+-    notify_via_xen_event_channel(v->domain, v->arch.hvm_vcpu.xen_port);
++    notify_via_xen_event_channel(v->domain, port);
+ 
+     return 1;
+ }
+@@ -1430,7 +1448,8 @@ int hvm_hap_nested_page_fault(paddr_t gpa,
+      * to the mmio handler.
+      */
+     if ( (p2mt == p2m_mmio_dm) || 
+-         (access_w && (p2mt == p2m_ram_ro)) )
++         (access_w && (p2mt == p2m_ram_ro)) ||
++         (p2mt == p2m_writeprotection) )
+     {
+         put_gfn(p2m->domain, gfn);
+         if ( !handle_mmio() )
+@@ -3796,7 +3815,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+                 if ( iorp->va != NULL )
+                     /* Initialise evtchn port info if VCPUs already created. */
+                     for_each_vcpu ( d, v )
++                    {
+                         get_ioreq(v)->vp_eport = v->arch.hvm_vcpu.xen_port;
++                        get_ioreq(v)->vgt_eport = v->arch.hvm_vcpu.vgt_port;
++                    }
+                 spin_unlock(&iorp->lock);
+                 break;
+             case HVM_PARAM_BUFIOREQ_PFN: 
+@@ -3875,9 +3897,17 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+                     if ( rc )
+                         break;
+ 
++                    rc = hvm_replace_event_channel(v, a.value,
++                                                   &v->arch.hvm_vcpu.vgt_port);
++                    if ( rc )
++                        break;
++
+                     spin_lock(&iorp->lock);
+                     if ( iorp->va != NULL )
++                    {
+                         get_ioreq(v)->vp_eport = v->arch.hvm_vcpu.xen_port;
++                        get_ioreq(v)->vgt_eport = v->arch.hvm_vcpu.vgt_port;
++                    }
+                     spin_unlock(&iorp->lock);
+                 }
+                 domain_unpause(d);
+@@ -4375,6 +4405,128 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+         break;
+     }
+ 
++    case HVMOP_vgt_wp_pages: {
++        xen_hvm_vgt_wp_pages_t wp;
++        struct domain *d;
++
++        if ( copy_from_guest(&wp, arg, 1 ) )
++            return -EFAULT;
++
++	if ( wp.nr_pages >= MAX_WP_BATCH_PAGES )
++            return -EFAULT;
++
++        d = rcu_lock_domain_by_any_id(wp.domid);
++        if ( d == NULL )
++            return -ESRCH;
++
++        if ( !is_hvm_domain(d) ){
++            rc = -EINVAL;
++        }
++	else {
++	    hap_write_protect_pages(d, wp.wp_pages, wp.nr_pages, wp.set);
++	}
++        rcu_unlock_domain(d);
++
++	break;
++    }
++
++    case HVMOP_vgt_set_trap_io: {
++        xen_hvm_vgt_set_trap_io_t trap;
++        struct domain *d;
++        int i;
++
++        /*
++         * In case there are multiple calls to reset the trap area,
++         * the latest one will overwright the previous one.
++         */
++
++        if ( copy_from_guest(&trap, arg, 1 ) )
++            return -EFAULT;
++
++        d = rcu_lock_domain_by_any_id(trap.domid);
++        if ( d == NULL )
++            return -ESRCH;
++
++        if ( !is_hvm_domain(d) ){
++            rc = -EINVAL;
++            goto param_fail_vgt_trap_io;
++        }
++
++        rangeset_destroy(d->arch.hvm_domain.vgt_mmio_trap_range);
++
++        d->arch.hvm_domain.vgt_mmio_trap_range =
++            rangeset_new(d, "vGT MMIO Trap Range ", RANGESETF_prettyprint_hex);
++        ASSERT(d->arch.hvm_domain.vgt_mmio_trap_range);
++
++        for (i=0; i<trap.nr_mmio_frags; i++){
++            rc = rangeset_add_range(d->arch.hvm_domain.vgt_mmio_trap_range,
++                    trap.mmio_frags[i].s, trap.mmio_frags[i].e);
++            if (rc)
++                goto param_fail_vgt_trap_io;
++        }
++
++        rangeset_printk(d->arch.hvm_domain.vgt_mmio_trap_range);
++        printk("\n");
++
++    param_fail_vgt_trap_io:
++        rcu_unlock_domain(d);
++
++        break;
++    }
++
++    case HVMOP_vgt_map_mmio: {
++        xen_hvm_vgt_map_mmio_t memmap;
++        struct domain *d;
++
++        if ( copy_from_guest(&memmap, arg, 1 ) )
++            return -EFAULT;
++
++        d = rcu_lock_domain_by_id(memmap.domid);
++        if ( d == NULL )
++            return -ESRCH;
++
++        if ( !is_hvm_domain(d) ){
++            rc = -EINVAL;
++            goto param_fail_vgt_map_mmio;
++        }
++
++        if ( memmap.map )
++            vgt_domctl_add_range(d, memmap.first_gfn,
++                                 memmap.first_mfn, memmap.nr_mfns);
++        else
++            vgt_domctl_remove_range(d, memmap.first_gfn,
++                                 memmap.first_mfn, memmap.nr_mfns);
++
++    param_fail_vgt_map_mmio:
++        rcu_unlock_domain(d);
++
++	break;
++    }
++
++    case HVMOP_vgt_enable: {
++        xen_hvm_vgt_enable_t vgt_enable;
++        struct domain *d;
++
++        if ( copy_from_guest(&vgt_enable, arg, 1 ) )
++            return -EFAULT;
++
++        d = rcu_lock_domain_by_any_id(vgt_enable.domid);
++        if ( d == NULL )
++            return -ESRCH;
++
++        if ( !is_hvm_domain(d) ){
++            rc = -EINVAL;
++            goto param_fail_vgt_enable;
++        }
++
++        rc = vgt_hvm_init(d);
++
++    param_fail_vgt_enable:
++        rcu_unlock_domain(d);
++
++	break;
++    }
++
+     case HVMOP_xentrace: {
+         xen_hvm_xentrace_t tr;
+ 
+diff --git a/xen/arch/x86/hvm/intercept.c b/xen/arch/x86/hvm/intercept.c
+index 85caa0c..578a59d 100644
+--- a/xen/arch/x86/hvm/intercept.c
++++ b/xen/arch/x86/hvm/intercept.c
+@@ -22,6 +22,7 @@
+ #include <xen/types.h>
+ #include <xen/sched.h>
+ #include <asm/regs.h>
++#include <asm/vgt.h>
+ #include <asm/hvm/hvm.h>
+ #include <asm/hvm/support.h>
+ #include <asm/hvm/domain.h>
+@@ -39,7 +40,9 @@ hvm_mmio_handlers[HVM_MMIO_HANDLER_NR] =
+     &vlapic_mmio_handler,
+     &vioapic_mmio_handler,
+     &msixtbl_mmio_handler,
+-    &iommu_mmio_handler
++    &iommu_mmio_handler,
++    &writeprotection_handler,	/* write protection to guest pages */
++    &vgt_mmio_handler
+ };
+ 
+ static int hvm_mmio_access(struct vcpu *v,
+@@ -193,6 +196,12 @@ int hvm_io_intercept(ioreq_t *p, int type)
+     int i;
+     unsigned long addr, size;
+ 
++    /*
++     * vGT memory access is high frequency, so it needs to be
++     * in fast path. We add hook here before the io chain
++     * walk. But 0xcf8/cfc is not in this list.
++     */
++
+     if ( type == HVM_PORTIO )
+     {
+         int rc = dpci_ioport_intercept(p);
+diff --git a/xen/arch/x86/hvm/vgt.c b/xen/arch/x86/hvm/vgt.c
+new file mode 100644
+index 0000000..aa57cbf
+--- /dev/null
++++ b/xen/arch/x86/hvm/vgt.c
+@@ -0,0 +1,229 @@
++/*
++ * vgt.c: code to trace the vGT MMIO access in HVM domain
++ *
++ * Copyright (c) 2011, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place - Suite 330, Boston, MA 02111-1307 USA.
++ */
++
++#include <xen/config.h>
++#include <xen/types.h>
++#include <xen/mm.h>
++#include <xen/xmalloc.h>
++#include <xen/domain.h>
++#include <xen/domain_page.h>
++#include <xen/event.h>
++#include <xen/trace.h>
++#include <xen/lib.h>
++#include <xen/iocap.h>
++#include <xen/sched.h>
++#include <asm/current.h>
++#include <asm/page.h>
++#include <asm/apic.h>
++#include <asm/hvm/hvm.h>
++#include <asm/hvm/io.h>
++#include <asm/hvm/support.h>
++#include <asm/p2m.h>
++#include <public/hvm/ioreq.h>
++#include <public/hvm/params.h>
++
++static int vgt_mmio_range(struct vcpu *v, unsigned long addr)
++{
++    return vgt_enabled(v->domain) &&
++        rangeset_contains_singleton(
++            v->domain->arch.hvm_domain.vgt_mmio_trap_range , addr);
++}
++
++static int _vgt_mmio_read_write(struct vcpu *v)
++{
++    get_ioreq(v)->is_vgt = 1;
++
++    return X86EMUL_UNHANDLEABLE; /* notify dom0 vGT driver to handle */
++}
++
++static int vgt_mmio_read(
++    struct vcpu *v, unsigned long gpa,
++    unsigned long bytes, unsigned long *p_data)
++{
++    return _vgt_mmio_read_write(v);
++}
++
++static int vgt_mmio_write(struct vcpu *v, unsigned long gpa,
++                        unsigned long bytes, unsigned long data)
++{
++    return _vgt_mmio_read_write(v);
++}
++
++const struct hvm_mmio_handler vgt_mmio_handler = {
++    .check_handler = vgt_mmio_range,
++    .read_handler = vgt_mmio_read,
++    .write_handler = vgt_mmio_write
++};
++
++/*
++ * Check the fault address to see if it is from writeprotection pages.
++ *    Return 1: Yes, 0: No.
++ */
++static int writeprotecion_page(struct vcpu *v, unsigned long addr)
++{
++    unsigned long gpfn = addr >> PAGE_SHIFT;
++    struct wp_hash_table *he;
++
++    if (!vgt_enabled(v->domain))
++	    return 0;
++
++    spin_lock(&wp_htable_lock(v->domain));
++    he = lookup_wp_hash_table(wp_htable(v->domain), gpfn);
++    spin_unlock(&wp_htable_lock(v->domain));
++
++    return (he != NULL);
++}
++
++const struct hvm_mmio_handler writeprotection_handler = {
++    .check_handler = writeprotecion_page,
++    .read_handler = vgt_mmio_read,
++    .write_handler = vgt_mmio_write
++};
++
++
++void vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn)
++{
++    int index = wp_hash(gpfn);
++    struct wp_hash_table *ne;
++
++    ASSERT( lookup_wp_hash_table(wp_ht, gpfn) == NULL );
++    if (wp_ht[index].gpfn == WP_INVALID_GPFN)
++        wp_ht[index].gpfn = gpfn;
++    else {
++        /* self-automicity */
++        ne = xmalloc_bytes(sizeof(wp_ht[0]));
++	ne->next = wp_ht[index].next;
++	ne->gpfn = gpfn;
++	wp_ht[index].next = ne;
++    }
++}
++
++void vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn)
++{
++    int index = wp_hash(gpfn);
++    struct wp_hash_table *next, *prev;
++
++    if (wp_ht[index].gpfn == gpfn) {
++        wp_ht[index].gpfn = WP_INVALID_GPFN;
++    }
++    else {
++        prev = &wp_ht[index];
++	while (1) {
++            next=prev->next;
++	    if ( next == NULL ) {
++	        printk("vgt_wp_hash_rem hash_table %p remove %lx not found\n",
++			   wp_ht, gpfn);
++	        return;
++	    }
++	    if (next->gpfn == gpfn) {
++  	        /* self-automicity */
++ 	        prev->next = next->next;
++ 	        xfree (next);
++		return;
++	    }
++	    prev = next;
++	}
++    }
++}
++
++struct wp_hash_table *lookup_wp_hash_table(
++    struct wp_hash_table *wp_ht,
++    unsigned long gpfn)
++{
++    int index = wp_hash(gpfn);
++    struct wp_hash_table *entry;
++
++    for ( entry=&wp_ht[index]; entry!=NULL; entry=entry->next) {
++        if (entry->gpfn == gpfn)
++            break;
++    }
++    return entry;
++}
++
++static void free_vgt_wp_hash_chain(struct wp_hash_table *chain)
++{
++    struct wp_hash_table *p = chain;
++    struct wp_hash_table *n;
++
++    while (p) {
++        n = p->next;
++	xfree (p);
++	p = n;
++    }
++}
++
++void free_vgt_wp_hash(struct wp_hash_table *wp_ht)
++{
++    int i;
++
++    for ( i = 0; i < WP_HASH_SIZE; i++ )
++        if ( wp_ht[i].next != NULL )
++            free_vgt_wp_hash_chain (wp_ht[i].next);
++}
++
++/* ret:
++      0 - success
++      negative - non success
++*/
++int vgt_domctl_add_range(struct domain *d, unsigned long gfn,
++        unsigned long mfn, unsigned long nr_mfns)
++{
++    unsigned long hva;
++    int ret, i;
++
++    printk("DPCI_ADD_MAPPING_VGT : domid=%d gfn=0x%lx mfn=0x%lx nr_mfns=0x%lx\n",
++            d->domain_id, gfn, mfn, nr_mfns );
++
++    /* direct map without trap & emulation */
++    ret = iomem_permit_access(d, mfn, mfn + nr_mfns - 1);
++    for ( i = 0; i < nr_mfns; i++ )
++        set_mmio_p2m_entry(d, gfn+i, _mfn(mfn+i));
++
++    hva = (unsigned long) mfn_to_virt(mfn);
++    ret = map_pages_to_xen(hva, mfn, nr_mfns, PAGE_HYPERVISOR_NOCACHE);
++    if (ret != 0)
++    {
++        printk("Warning: mapping domain page error\n");
++        domain_crash(current->domain);
++    }
++
++    return ret;
++}
++
++/* ret:
++       0 - success
++       negative - failure
++*/
++int vgt_domctl_remove_range(struct domain *d, unsigned long gfn,
++        unsigned long mfn, unsigned long nr_mfns)
++{
++    int i, ret;
++    /*
++       remove the pfn and mfn record for MMIO trap and emulation
++     */
++    printk("DPCI_REMOVE_MAPPING_VGT : domid=%d gfn=%lx mfn=%lx nr_mfns=%lx\n",
++            d->domain_id, gfn, mfn, nr_mfns);
++
++    for ( i = 0; i < nr_mfns; i++ )
++        clear_mmio_p2m_entry(d, gfn+i);
++    ret = iomem_deny_access(d, mfn, mfn + nr_mfns - 1);
++    destroy_xen_mappings( (unsigned long)mfn_to_virt(mfn),
++            (unsigned long)mfn_to_virt(mfn + nr_mfns - 1) );
++    return ret;
++}
+diff --git a/xen/arch/x86/hvm/vmsi.c b/xen/arch/x86/hvm/vmsi.c
+index 36de312..a2563a4 100644
+--- a/xen/arch/x86/hvm/vmsi.c
++++ b/xen/arch/x86/hvm/vmsi.c
+@@ -34,6 +34,7 @@
+ #include <xen/sched.h>
+ #include <xen/irq.h>
+ #include <public/hvm/ioreq.h>
++#include <public/vcpu.h>
+ #include <asm/hvm/io.h>
+ #include <asm/hvm/vpic.h>
+ #include <asm/hvm/vlapic.h>
+diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
+index 77dcafc..fc3e6e2 100644
+--- a/xen/arch/x86/mm.c
++++ b/xen/arch/x86/mm.c
+@@ -1017,6 +1017,20 @@ get_page_from_l4e(
+     } while ( 0 )
+ #endif
+ 
++/*
++ * No need to remove reserved bits when pte is marked non-present,
++ * since a non-present to present change normally implicates a
++ * completely new bit set
++ */
++#define adjust_guest_l1e_rsvd(pl1e, d, mfn)                     \
++    do {                                                        \
++        if ( likely(l1e_get_flags((pl1e)) & _PAGE_PRESENT) &&   \
++             iomem_forward_permitted(d, mfn, mfn) )             \
++        {                                                       \
++            l1e_add_rsvd((pl1e), _PAGE_FORWARD);                \
++        }                                                       \
++    } while ( 0 )
++
+ #define adjust_guest_l2e(pl2e, d)                               \
+     do {                                                        \
+         if ( likely(l2e_get_flags((pl2e)) & _PAGE_PRESENT) &&   \
+@@ -1209,7 +1223,14 @@ static int alloc_l1_table(struct page_info *page)
+                 break;
+             }
+ 
++        if ( l1e_get_rsvd(pl1e[i]) & (_PAGE_FORWARD|_PAGE_PRESENT) )
++        {
++            MEM_LOG("Captured guest reserved bit usage, which is conflicting with Xen!");
++            goto fail;
++        }
++
+         adjust_guest_l1e(pl1e[i], d);
++        adjust_guest_l1e_rsvd(pl1e[i], d, l1e_get_pfn(pl1e[i]));
+     }
+ 
+     unmap_domain_page(pl1e);
+@@ -1699,10 +1720,37 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
+             return -EINVAL;
+         }
+ 
++        if ( l1e_has_changed_rsvd(ol1e, nl1e, _PAGE_FORWARD) )
++        {
++            /*
++             * Condition check whether guest itself uses reserved bit.
++             * Suppose reserved bits are used only when P bit is cleared,
++             * such as in swap purpose
++             */
++            if ( !(l1e_get_rsvd(ol1e) & _PAGE_FORWARD) &&
++                 (l1e_get_rsvd(nl1e) & _PAGE_FORWARD) )
++            {
++                MEM_LOG("Captured guest reserved bit usage, which is conflicting with Xen!");
++                return -EINVAL;
++            }
++
++            /*
++             * Guest may not compose the new entry based on old content,
++             * and thus it's possible to have Xen populated reserved bits lost.
++             * Warn such case, but it should be fine, since we anyway adjust
++             * l1e to enforce the forwarding requirement.
++             */
++            if ( ((l1e_get_rsvd(ol1e) & (_PAGE_FORWARD|_PAGE_PRESENT)) ==
++                                        (_PAGE_FORWARD|_PAGE_PRESENT)) &&
++                 !(l1e_get_rsvd(nl1e) & _PAGE_FORWARD) )
++                MEM_LOG("Guest tempts to clear forwarding bit set by Xen!");
++        }
++
+         /* Fast path for identical mapping, r/w and presence. */
+         if ( !l1e_has_changed(ol1e, nl1e, _PAGE_RW | _PAGE_PRESENT) )
+         {
+             adjust_guest_l1e(nl1e, pt_dom);
++            adjust_guest_l1e_rsvd(nl1e, pt_dom, l1e_get_pfn(nl1e));
+             if ( UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
+                               preserve_ad) )
+             {
+@@ -1732,6 +1780,7 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
+             put_page(page);
+ 
+         adjust_guest_l1e(nl1e, pt_dom);
++        adjust_guest_l1e_rsvd(nl1e, pt_dom, l1e_get_pfn(nl1e));
+         if ( unlikely(!UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
+                                     preserve_ad)) )
+         {
+@@ -4678,6 +4727,61 @@ static int xenmem_add_to_physmap(struct domain *d,
+     return xenmem_add_to_physmap_once(d, xatp);
+ }
+ 
++static int get_mfn_from_pfn(XEN_GUEST_HANDLE(xen_get_mfn_from_pfn_t) arg)
++{
++    struct xen_get_mfn_from_pfn cmd_info;
++    struct domain *d;
++    int rc=0, i;
++    xen_pfn_t *pfns = NULL;
++    xen_pfn_t pfn;
++    struct p2m_domain *p2m;
++    p2m_type_t t;
++
++    if ( !is_hardware_domain(current->domain) )
++        return -EPERM;
++
++    if ( copy_from_guest(&cmd_info, arg, 1) )
++        return -EFAULT;
++
++    d = rcu_lock_domain_by_any_id(cmd_info.domid);
++    if ( d == NULL )
++        return -ESRCH;
++
++    /* sanity check for security */
++    if (cmd_info.nr_pfns > 2048 )
++        return -ENOMEM;
++
++    pfns = xmalloc_array(xen_pfn_t, cmd_info.nr_pfns);
++    if (pfns == NULL)
++        return -ENOMEM;
++
++    if (copy_from_guest(pfns, cmd_info.pfn_list, cmd_info.nr_pfns)){
++        rc = -EFAULT;
++        goto out;
++    }
++
++    p2m = p2m_get_hostp2m(d);
++    for(i=0; i < cmd_info.nr_pfns; i++){
++        pfn = pfns[i];
++        pfns[i] = mfn_x(get_gfn_query(d, pfn, &t));
++		if(pfns[i] == INVALID_MFN){
++			rc = -EINVAL;
++			goto out;
++		}
++		put_gfn(d, pfn);
++    }
++
++    if (copy_to_guest(cmd_info.pfn_list, pfns, cmd_info.nr_pfns)){
++        rc = -EFAULT;
++        goto out;
++    }
++
++out:
++    rcu_unlock_domain(d);
++    xfree(pfns);
++    return rc;
++}
++
+ long arch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg)
+ {
+     int rc;
+@@ -4936,6 +5040,15 @@ long arch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg)
+         return rc;
+     }
+ 
++#ifdef __x86_64__
++    case XENMEM_get_sharing_freed_pages:
++        return mem_sharing_get_nr_saved_mfns();
++#endif
++
++    case XENMEM_get_mfn_from_pfn:
++        rc = get_mfn_from_pfn(guest_handle_cast(arg, xen_get_mfn_from_pfn_t));
++        break;
++
+     default:
+         return subarch_memory_op(op, arg);
+     }
+@@ -5063,7 +5176,28 @@ static int ptwr_emulated_update(
+         break;
+     }
+ 
++    if ( l1e_get_flags(nl1e) & _PAGE_PRESENT )
++    {
++        ol1e = l1e_from_intpte(old);
++        /* same check as the comment in mod_l1e_entry */
++        if ( l1e_has_changed_rsvd(ol1e, nl1e, _PAGE_FORWARD) )
++        {
++            if ( !(l1e_get_rsvd(ol1e) & _PAGE_FORWARD) &&
++                 (l1e_get_rsvd(nl1e) & _PAGE_FORWARD) )
++            {
++                MEM_LOG("Captured guest reserved bit usage, which is conflicting with Xen!");
++                return X86EMUL_UNHANDLEABLE;
++            }
++
++            if ( ((l1e_get_rsvd(ol1e) & (_PAGE_FORWARD|_PAGE_PRESENT)) ==
++                                        (_PAGE_FORWARD|_PAGE_PRESENT)) &&
++                 !(l1e_get_rsvd(nl1e) & _PAGE_FORWARD) )
++                MEM_LOG("Guest tempts to clear forwarding bit set by Xen!");
++        }
++    }
++
+     adjust_guest_l1e(nl1e, d);
++    adjust_guest_l1e_rsvd(nl1e, d, l1e_get_pfn(nl1e));
+ 
+     /* Checked successfully: do the update (write or cmpxchg). */
+     pl1e = map_domain_page(mfn);
+diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
+index bff05d9..15bb46d 100644
+--- a/xen/arch/x86/mm/hap/hap.c
++++ b/xen/arch/x86/mm/hap/hap.c
+@@ -208,6 +208,45 @@ void hap_logdirty_init(struct domain *d)
+                           hap_clean_dirty_bitmap);
+ }
+ 
++/*
++ * Write-protect guest pages.
++ *    A guest page may be write-protected or unwrite-protected, 
++ *    to track the guest write operations.
++ *    It is initially designed for GPU PPGTT page table pages.
++ *  gpfn: array base containing the gpfns for write-protection.
++ *  num: size of the array.
++ *  wr: 1: write-protection, 0: unwrite-protection.
++ */
++int hap_write_protect_pages(struct domain *d, 
++        unsigned long *gpfn, int num, int wr)
++{
++    int i;
++    p2m_type_t  ot, nt;
++
++    if ( wr ) {
++        ot = p2m_ram_rw;
++	nt = p2m_writeprotection;
++    } else {
++	ot = p2m_writeprotection;
++        nt = p2m_ram_rw;
++    }
++
++    spin_lock(&wp_htable_lock(d));
++
++    for ( i=0; i < num; i++) {
++        p2m_change_type_range(d, gpfn[i], gpfn[i] + 1, ot, nt);
++	if (wr)
++            vgt_wp_hash_add(wp_htable(d), gpfn[i]);
++	else
++            vgt_wp_hash_rem(wp_htable(d), gpfn[i]);
++    }
++
++    spin_unlock(&wp_htable_lock(d));
++
++    flush_tlb_mask(d->domain_dirty_cpumask);
++    return 0;
++}
++
+ /************************************************/
+ /*             HAP SUPPORT FUNCTIONS            */
+ /************************************************/
+diff --git a/xen/arch/x86/mm/p2m-ept.c b/xen/arch/x86/mm/p2m-ept.c
+index 595c6e7..993e3a8 100644
+--- a/xen/arch/x86/mm/p2m-ept.c
++++ b/xen/arch/x86/mm/p2m-ept.c
+@@ -69,6 +69,7 @@ static void ept_p2m_type_to_flags(ept_entry_t *entry, p2m_type_t type, p2m_acces
+                                                     entry->mfn);
+             break;
+         case p2m_ram_logdirty:
++        case p2m_writeprotection:
+         case p2m_ram_ro:
+         case p2m_ram_shared:
+             entry->r = entry->x = 1;
+diff --git a/xen/arch/x86/physdev.c b/xen/arch/x86/physdev.c
+index 3733c7a..b27a5e4 100644
+--- a/xen/arch/x86/physdev.c
++++ b/xen/arch/x86/physdev.c
+@@ -478,6 +478,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         ret = -EFAULT;
+         if ( copy_from_guest(&set_iopl, arg, 1) != 0 )
+             break;
++	printk("VGT: PHYSDEVOP_set_iopl iopl %x\n", set_iopl.iopl);
+         ret = -EINVAL;
+         if ( set_iopl.iopl > 3 )
+             break;
+@@ -488,9 +489,11 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+ 
+     case PHYSDEVOP_set_iobitmap: {
+         struct physdev_set_iobitmap set_iobitmap;
++
+         ret = -EFAULT;
+         if ( copy_from_guest(&set_iobitmap, arg, 1) != 0 )
+             break;
++	printk("VGT: PHYSDEVOP_set_iobitmap !!!\n");
+         ret = -EINVAL;
+         if ( !guest_handle_okay(set_iobitmap.bitmap, IOBMP_BYTES) ||
+              (set_iobitmap.nr_ports > 65536) )
+diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
+index 7175a82..f9b881d 100644
+--- a/xen/arch/x86/platform_hypercall.c
++++ b/xen/arch/x86/platform_hypercall.c
+@@ -30,6 +30,7 @@
+ #include <asm/mtrr.h>
+ #include <asm/io_apic.h>
+ #include <asm/setup.h>
++#include <asm/vgt.h>
+ #include "cpu/mtrr/mtrr.h"
+ #include <xsm/xsm.h>
+ 
+@@ -597,6 +598,14 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
+     }
+     break;
+ 
++    case XENPF_set_vgt_info:
++    {
++        ret = set_vgt_info(op->u.vgt_info.gen_dev_bdf,
++                            op->u.vgt_info.gen_dev_type);
++        break;
++    }
++    break;
++
+     default:
+         ret = -ENOSYS;
+         break;
+diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
+index 57dbd0c..76c169b 100644
+--- a/xen/arch/x86/traps.c
++++ b/xen/arch/x86/traps.c
+@@ -73,6 +73,7 @@
+ #include <asm/hpet.h>
+ #include <public/arch-x86/cpuid.h>
+ #include <xsm/xsm.h>
++#include <asm/vgt.h>
+ 
+ /*
+  * opt_nmi: one of 'ignore', 'dom0', or 'fatal'.
+@@ -424,7 +425,7 @@ void fatal_trap(int trapnr, struct cpu_user_regs *regs)
+           (regs->eflags & X86_EFLAGS_IF) ? "" : ", IN INTERRUPT CONTEXT");
+ }
+ 
+-static void do_guest_trap(
++void do_guest_trap(
+     int trapnr, const struct cpu_user_regs *regs, int use_error_code)
+ {
+     struct vcpu *v = current;
+@@ -1326,6 +1327,11 @@ static int fixup_page_fault(unsigned long addr, struct cpu_user_regs *regs)
+         return ret;
+     }
+ 
++    /* we take some reserved bits to indicate a trapped MMIO access */
++    if ( ((regs->error_code & (PFEC_page_present | PFEC_reserved_bit)) ==
++                              (PFEC_page_present | PFEC_reserved_bit)) &&
++         do_rsvd_page_fault(v, addr, regs) )
++        return EXCRET_fault_fixed;
+     return 0;
+ }
+ 
+@@ -1587,6 +1593,8 @@ static int guest_io_okay(
+     {
+         union { uint8_t bytes[2]; uint16_t mask; } x;
+ 
++	printk("VGT: =====: arch.pv_vcpu.iobmp_limit %x bitmap %lx\n",
++		v->arch.pv_vcpu.iobmp_limit, (unsigned long)v->arch.pv_vcpu.iobmp.p);
+         /*
+          * Grab permission bytes from guest space. Inaccessible bytes are
+          * read as 0xff (no access allowed).
+@@ -1728,6 +1736,67 @@ static uint32_t guest_io_read(
+     return data;
+ }
+ 
++static bool_t vgt_cfg_space(unsigned int port, unsigned int bytes,
++	bool_t wr, struct vcpu *v, struct cpu_user_regs *regs)
++{
++    unsigned int _port;
++
++    if ( v->domain != dom0 )
++	return 0;
++
++    _port = port & ~3;
++    if ( _port == 0xCF8 && wr &&
++	CF8_to_BDF(regs->eax) == vgt_bdf ) {
++
++	ASSERT ((port & 3) == 0 && (bytes == 4));
++
++        /* VGT CFG space access, forward to vGT driver */
++	if ( ioports_forwarding_started(v->domain) ) {
++		/* Forward only after the guest is ready to process. */
++		v->domain->arch.pci_cf8 = regs->eax;
++	        vgt_inject_virtual_exception (regs, 1);
++		return 1;
++        }
++    }
++    else if (_port == 0xCFC &&
++	CF8_to_BDF(v->domain->arch.pci_cf8) == vgt_bdf) {
++	if ( ioports_forwarding_started(v->domain) ) {
++		/* Forward only after the guest is ready to process. */
++		vgt_inject_virtual_exception (regs, 1);
++	        return 1;
++	}
++    }
++    return 0;
++}
++
++static bool_t pio_forwarding(
++    unsigned int port, unsigned int bytes, int wr,
++    struct vcpu *v, struct cpu_user_regs *regs)
++{
++    int perm, rc=0;
++
++    if ( vgt_cfg_space(port, bytes, wr, v, regs) )
++	return 1;
++
++    perm = ioports_forwarding_permitted(v->domain, port, port ) << 1;
++    perm |= ioports_forwarding_permitted(v->domain,
++			port + bytes - 1, port + bytes - 1);
++    switch ( perm ) {
++        case 0:
++            break;
++        case 3:	/* all port are within forwarding list */
++	    vgt_inject_virtual_exception (regs, 1);
++            rc = 1;
++	    break;
++        case 1:
++        case 2:
++        default:
++	    ASSERT (0);	/* TODO */
++            break;
++    }
++    return rc;
++}
++
+ static void guest_io_write(
+     unsigned int port, unsigned int bytes, uint32_t data,
+     struct vcpu *v, struct cpu_user_regs *regs)
+@@ -2010,6 +2079,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+                  (rd_ad(edi) > (data_limit - (op_bytes - 1))) ||
+                  !guest_io_okay(port, op_bytes, v, regs) )
+                 goto fail;
++            if ( pio_forwarding(port, op_bytes, 0, v, regs) )
++                goto skip;
+             data = guest_io_read(port, op_bytes, v, regs);
+             if ( (rc = copy_to_user((void *)data_base + rd_ad(edi),
+                                     &data, op_bytes)) != 0 )
+@@ -2036,9 +2107,14 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+                                      + op_bytes - rc, 0);
+                 return EXCRET_fault_fixed;
+             }
+-            guest_io_write(port, op_bytes, data, v, regs);
+-            wr_ad(esi, regs->esi + (int)((regs->eflags & X86_EFLAGS_DF)
++            if ( pio_forwarding(port, op_bytes, 1, v, regs) )
++		goto skip;
++	    else
++            {
++                guest_io_write(port, op_bytes, data, v, regs);
++                wr_ad(esi, regs->esi + (int)((regs->eflags & X86_EFLAGS_DF)
+                                          ? -op_bytes : op_bytes));
++            }
+             break;
+         }
+ 
+@@ -2093,6 +2169,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+     exec_in:
+         if ( !guest_io_okay(port, op_bytes, v, regs) )
+             goto fail;
++        if ( pio_forwarding(port, op_bytes, 0, v, regs ) )
++            goto skip;
+         if ( admin_io_okay(port, op_bytes, v, regs) )
+         {
+             mark_regs_dirty(regs);
+@@ -2123,6 +2201,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+     exec_out:
+         if ( !guest_io_okay(port, op_bytes, v, regs) )
+             goto fail;
++        if ( pio_forwarding(port, op_bytes, 1, v, regs ) )
++	    goto skip;
+         if ( admin_io_okay(port, op_bytes, v, regs) )
+         {
+             mark_regs_dirty(regs);
+diff --git a/xen/arch/x86/vgt.c b/xen/arch/x86/vgt.c
+new file mode 100644
+index 0000000..d1b6bd2
+--- /dev/null
++++ b/xen/arch/x86/vgt.c
+@@ -0,0 +1,671 @@
++/*
++ * vgt.c: core logic to handle mediated GT passthrough
++ * Copyright (c) 2011, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place - Suite 330, Boston, MA 02111-1307 USA.
++ */
++
++#include <xen/config.h>
++#include <xen/types.h>
++#include <xen/init.h>
++#include <xen/lib.h>
++#include <xen/mm.h>
++#include <xen/sched.h>
++#include <xen/console.h>
++#include <xen/domain.h>
++#include <xen/domain_page.h>
++#include <xen/iocap.h>
++#include <xen/xmalloc.h>
++#include <xen/delay.h>
++#include <xen/spinlock.h>
++#include <asm/shared.h>
++#include <asm/traps.h>
++#include <asm/paging.h>
++#include <asm/vgt.h>
++#include <asm/hvm/support.h>
++#include <asm/x86_emulate.h>
++#include <public/platform.h>
++
++#define VGT_LOG(_f, _a...) gdprintk(XENLOG_INFO, "vGT: " _f "\n" , ## _a)
++#define VGT_ERR(_f, _a...) gdprintk(XENLOG_ERR, "vGT: " _f "\n" , ## _a)
++//#define VGT_DEBUG
++#ifdef VGT_DEBUG
++#define VGT_DBG(_f, _a...) gdprintk(XENLOG_DEBUG, "vGT: " _f "\n" , ## _a)
++#else
++#define VGT_DBG(_f, _a...) ;
++#endif
++
++static unsigned int igd_gen = XEN_IGD_INVALID;
++unsigned long vgt_mmio_bar_start;
++char *vgt_mmio_hva;
++int gt_fifo_count;
++
++static enum {
++    FORCE_WAKE_STATE_ON,
++    FORCE_WAKE_STATE_OFF
++} force_wake_state = FORCE_WAKE_STATE_OFF;
++
++static DEFINE_SPINLOCK(vgt_io_lock);
++
++void (*vgt_force_wake_get)(void);
++void (*vgt_force_wake_put)(void);
++
++#define VGT_REG_READ(offset)	*((const volatile u32 *)(vgt_mmio_hva + offset))
++#define VGT_REG_WRITE(offset, val)	*((volatile u32 *)(vgt_mmio_hva + offset)) = (val)
++
++#define  FORCEWAKE                              0xA18C
++#define  FORCEWAKE_ACK_HSW                      0x130044
++#define  FORCEWAKE_ACK                          0x130090
++#define  FORCEWAKE_MT                           0xa188 /* multi-threaded */
++#define  FORCEWAKE_MT_ACK                       0x130040
++#define  ECOBUS                                 0xa180
++#define    FORCEWAKE_MT_ENABLE                  (1<<5)
++
++#define  GTFIFODBG                              0x120000
++#define    GT_FIFO_CPU_ERROR_MASK               7
++#define    GT_FIFO_OVFERR                       (1<<2)
++#define    GT_FIFO_IAWRERR                      (1<<1)
++#define    GT_FIFO_IARDERR                      (1<<0)
++
++#define  GT_FIFO_FREE_ENTRIES                   0x120008
++#define    GT_FIFO_NUM_RESERVED_ENTRIES         20
++
++#define GEN6_GT_THREAD_STATUS_REG 0x13805c
++#define GEN6_GT_THREAD_STATUS_CORE_MASK 0x7
++#define GEN6_GT_THREAD_STATUS_CORE_MASK_HSW (0x7 | (0x07 << 16))
++
++#define _MASKED_BIT_ENABLE(a) (((a) << 16) | (a))
++#define _MASKED_BIT_DISABLE(a) ((a) << 16)
++
++#define wait_for_atomic_us(COND, US) ({ \
++		        int i, ret__ = -1;      \
++		        for (i = 0; i < (US); i++) {    \
++		                if ((COND)) {           \
++		                        ret__ = 0;      \
++		                        break;          \
++		                }                       \
++		                udelay(1);              \
++		        }                               \
++		        ret__;                          \
++		})
++
++#define NEED_FORCE_WAKE(reg)	(((reg) - vgt_mmio_bar_start) < 0x40000 && ((reg) - vgt_mmio_bar_start) != FORCEWAKE)
++
++static void gen6_wait_for_thread_c0(void)
++{
++	u32 gt_thread_status_mask;
++
++	WARN_ON(igd_gen == XEN_IGD_INVALID);
++
++	if (igd_gen == XEN_IGD_HSW)
++		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK_HSW;
++	else
++		gt_thread_status_mask = GEN6_GT_THREAD_STATUS_CORE_MASK;
++
++	/* w/a for a sporadic read returning 0
++	 * by waiting for the GT thread to wake up.
++	 */
++	if (wait_for_atomic_us((VGT_REG_READ(GEN6_GT_THREAD_STATUS_REG) & gt_thread_status_mask) == 0, 500))
++		VGT_ERR("GT thread status wait timed out\n");
++}
++
++void gen6_gt_check_fifodbg(void)
++{
++	u32 gtfifodbg;
++	gtfifodbg = VGT_REG_READ(GTFIFODBG);
++	if (gtfifodbg & GT_FIFO_CPU_ERROR_MASK) {
++		VGT_ERR("MMIO read or write has been dropped %x\n", gtfifodbg);
++		VGT_REG_WRITE(GTFIFODBG, GT_FIFO_CPU_ERROR_MASK);
++	}
++}
++
++
++void gen6_force_wake_get (void)
++{
++	u32 forcewake_ack;
++
++	WARN_ON(igd_gen == XEN_IGD_INVALID);
++
++	if (igd_gen == XEN_IGD_HSW)
++		forcewake_ack = FORCEWAKE_ACK_HSW;
++	else
++		forcewake_ack = FORCEWAKE_ACK;
++
++	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1) == 0, 500))
++		VGT_ERR("Force wake wait timed out\n");
++
++	VGT_REG_WRITE(FORCEWAKE, 1);
++	VGT_REG_READ(ECOBUS);
++
++	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 500))
++		VGT_ERR("Force wake wait timed out\n");
++
++	gen6_wait_for_thread_c0();
++}
++
++void gen6_force_wake_put (void)
++{
++	VGT_REG_WRITE(FORCEWAKE, 0);
++	VGT_REG_READ(ECOBUS);
++	gen6_gt_check_fifodbg();
++}
++
++void gen7_force_wake_mt_get (void)
++{
++	u32 forcewake_ack;
++
++	WARN_ON(igd_gen == XEN_IGD_INVALID);
++
++	if (igd_gen == XEN_IGD_HSW)
++		forcewake_ack = FORCEWAKE_ACK_HSW;
++	else
++		forcewake_ack = FORCEWAKE_MT_ACK;
++
++	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1) == 0, 500))
++		VGT_ERR("Force wake wait timed out\n");
++
++	VGT_REG_WRITE(FORCEWAKE_MT, _MASKED_BIT_ENABLE(1));
++	VGT_REG_READ(ECOBUS);
++
++	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 500))
++		VGT_ERR("Force wake wait timed out\n");
++
++	gen6_wait_for_thread_c0();
++}
++
++void gen7_force_wake_mt_put (void)
++{
++	VGT_REG_WRITE(FORCEWAKE_MT, _MASKED_BIT_DISABLE(1));
++	VGT_REG_READ(ECOBUS);
++	gen6_gt_check_fifodbg();
++}
++
++int gen6_gt_wait_for_fifo(void)
++{
++	int ret = 0;
++
++	if (gt_fifo_count < GT_FIFO_NUM_RESERVED_ENTRIES) {
++		int loop = 500;
++		u32 fifo = VGT_REG_READ(GT_FIFO_FREE_ENTRIES);
++		while (fifo <= GT_FIFO_NUM_RESERVED_ENTRIES && loop--) {
++			udelay(10);
++			fifo = VGT_REG_READ(GT_FIFO_FREE_ENTRIES);
++		}
++		if (loop < 0 && fifo <= GT_FIFO_NUM_RESERVED_ENTRIES)
++			++ret;
++		gt_fifo_count = fifo;
++	}
++	gt_fifo_count--;
++
++	return ret;
++}
++
++
++int vgt_set_mmio_trap(struct domain *d, unsigned long mfn_start, unsigned long mfn_end)
++{
++    unsigned long hva;
++    int rc;
++
++    rc = iomem_permit_forward ( d, mfn_start, mfn_end );
++    hva = (unsigned long) mfn_to_virt ( mfn_start );
++    rc |= map_pages_to_xen ( hva, mfn_start, mfn_end - mfn_start + 1, PAGE_HYPERVISOR_NOCACHE );
++    VGT_LOG ( "Setup MMIO range [0x%lx - 0x%lx](hva 0x%lx) for trap. return %d\n",
++              mfn_start << PAGE_SHIFT, mfn_end << PAGE_SHIFT, hva, rc );
++
++    if (rc)
++	printk("vgt_set_mmio_trap failed %d\n", rc);
++    else {
++	vgt_mmio_bar_start = mfn_start << PAGE_SHIFT;
++	vgt_mmio_hva = (char *)hva;
++	VGT_LOG("vgt_mmio_bar_start: 0x%lx\n", vgt_mmio_bar_start);
++	VGT_LOG("vgt_mmio_hva: 0x%lx\n", (unsigned long)vgt_mmio_hva);
++    }
++    return rc;
++}
++
++unsigned int vgt_bdf = -1; /* -1 means an invalid value */
++
++int set_vgt_info(unsigned int gen_dev_bdf, unsigned int gen_dev_type)
++{
++    /* We only support GEN dev that's on bus 0 */
++    if ( PCI_BUS(gen_dev_bdf) != 0 )
++        return -EINVAL;
++
++    if ( gen_dev_type > XEN_IGD_MAX )
++        return -EINVAL;
++
++    vgt_bdf = gen_dev_bdf;
++    igd_gen = gen_dev_type;
++    VGT_LOG("vgt_bdf=0x%x, gen=%d\n", vgt_bdf, igd_gen);
++
++    WARN_ON(igd_gen == XEN_IGD_INVALID);
++
++    vgt_force_wake_get = gen6_force_wake_get;
++    vgt_force_wake_put = gen6_force_wake_put;
++    VGT_LOG("Set default force wake\n");
++
++    if ( igd_gen == XEN_IGD_IVB || igd_gen == XEN_IGD_HSW )
++    {
++        int ecobus;
++
++        gen7_force_wake_mt_get();
++        ecobus = VGT_REG_READ(ECOBUS);
++        gen7_force_wake_mt_put();
++
++        if (ecobus & FORCEWAKE_MT_ENABLE)
++        {
++            VGT_LOG("Use MT force wake\n");
++            vgt_force_wake_get = gen7_force_wake_mt_get;
++            vgt_force_wake_put = gen7_force_wake_mt_put;
++        }
++    }
++
++    return 0;
++}
++
++static inline void store_gdt(struct desc_ptr *dtr)
++{
++        asm volatile("sgdt %0":"=m" (*dtr));
++}
++
++static int hypercall_read_sysdata(struct vcpu *v, struct vcpu_sysdata_request *req)
++{
++    int bytes = req->ops.rd.bytes;
++
++#if 0
++    printk("hypercall_read_sysdata: src %lx bytes %x\n",
++	req->ops.rd.src_addr, req->ops.rd.bytes);
++#endif
++    if (bytes > 8)
++	bytes = 8;
++
++    req->ops.rd.sys_data = 0;
++    memcpy (&req->ops.rd.sys_data, (void*)req->ops.rd.src_addr, bytes);
++    return 1;
++}
++
++static int hypercall_get_segment(struct vcpu *v, struct vcpu_sysdata_request *req)
++{
++    struct desc_ptr gdtr;
++    struct desc_struct *desc_tbl, *pdesc;
++    uint16_t sel = req->ops.seg.selector;
++
++    req->ops.seg.xdt_desc[0] = 0;
++    req->ops.seg.xdt_desc[1] = 0;
++    if (sel & 4) {
++        printk("hypercall_get_selector %x in LDT, "
++		"not supported yet\n", sel);
++	return 0;
++    }
++    store_gdt(&gdtr);
++    desc_tbl = (struct desc_struct *) gdtr.base;
++    if ( sel >= gdtr.limit ) {
++        printk("hypercall_get_selector selector %x exceeds size"
++		"gdtr base %lx size %x\n", sel, gdtr.base, gdtr.limit);
++	return 0;
++    }
++    pdesc = desc_tbl + (sel>>3);
++    req->ops.seg.xdt_desc[0] = *(uint64_t *)pdesc;
++    if (!(pdesc->b & (1<<12)))	/* S bit = 0: system descriptor */
++    {
++	pdesc++;
++	req->ops.seg.xdt_desc[1] = *(uint64_t *)pdesc;
++    }
++    return 1;
++}
++
++int hypercall_get_sysdata(struct vcpu *v, struct vcpu_sysdata_request *req)
++{
++    if (req->op_type == VCPUOP_sysdata_get_segment)
++	return hypercall_get_segment (v, req);
++    else if ( req->op_type == VCPUOP_sysdata_read )
++    {
++	return hypercall_read_sysdata (v, req);
++    }
++    else {
++        printk("Wrong hypercall_get_sysdata op_type %d\n", (int)req->op_type);
++	return 0;
++    }
++}
++
++/*
++ * The service to finish I/O access on behave of the requester, in
++ * case that direct access to said I/O resources is trapped.
++ *
++ * Do we need a lock here? Perhaps not, since it's guest driver's
++ * responsibilty to avoid race contention on same MMIO...
++ *
++ * FIXME: though PIO logic is included here, we only trap MMIO for
++ * current stage. Need to add back GP handler hook to support PIO
++ * trap in the future if required.
++ */
++int hypercall_io_emulation(struct vcpu *v, struct vcpu_emul_ioreq *req)
++{
++    unsigned long data;
++    int rc = 1;
++
++    VGT_DBG("I/O request: %s, %lx\n",
++             req->type == PV_IOREQ_TYPE_PIO ? "pio" : "mmio", req->addr);
++
++    if ( req->type == PV_IOREQ_TYPE_PIO )
++    {
++	ASSERT( req->size <= 4 );
++        if ( req->dir == PV_IOREQ_READ )
++        {
++	    if ( (req->addr & ~3) == 0xcfc ) {
++		ASSERT (v->domain == dom0 );
++		ASSERT (CF8_to_BDF(v->domain->arch.pci_cf8) == vgt_bdf);
++		data = pci_conf_read (v->domain->arch.pci_cf8,
++				req->addr & 3, req->size);
++		memcpy (&req->data, &data, req->size);
++		return 1;
++	    }
++            else if ( (req->addr & ~3) == 0xcf8 ) {
++		printk("VGT: hypercall_io_emulation: read %x, "
++			"unexpected to be here!!!\n", (unsigned int)req->addr);
++	    }
++            switch (req->size)
++            {
++            case 1: req->data = inb ( req->addr ); break;
++            case 2: req->data = inw ( req->addr ); break;
++            case 4: req->data = inl ( req->addr ); break;
++	    default: ASSERT (0); break;
++            }
++        } // PV_IOREQ_READ
++        else
++        {
++	    if ( (req->addr & ~3) == 0xcfc ) {
++		ASSERT (v->domain == dom0 );
++		ASSERT (CF8_to_BDF(v->domain->arch.pci_cf8) == vgt_bdf);
++		pci_conf_write (v->domain->arch.pci_cf8,
++				(uint8_t) req->addr & 3,
++				(uint8_t)req->size, (uint32_t)req->data);
++		return 1;
++	    }
++            else if ( (req->addr & ~3) == 0xcf8 ) {
++		printk("VGT: hypercall_io_emulation: write %x, "
++			"unexpected to be here!!!\n", (unsigned int)req->addr);
++	    }
++            switch ( req->size )
++            {
++            case 1:
++                outb ( (uint8_t)req->data, req->addr );
++                break;
++            case 2:
++                outw ( (uint16_t)req->data, req->addr );
++                break;
++            case 4:
++                outl ( req->data, req->addr );
++                break;
++            default:
++	        ASSERT ( 0 );
++	        break;
++            }
++        } // PV_IOREQ_WRITE
++    } // PIO
++    else if (req->type == PV_IOREQ_TYPE_COPY) /* MMIO */
++    {
++        void *hva = maddr_to_virt ( req->addr );
++	int force_wake = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&vgt_io_lock, flags);
++
++	if ( req->dir == PV_IOREQ_READ )
++        {
++	    if (NEED_FORCE_WAKE(req->addr) && (force_wake_state == FORCE_WAKE_STATE_OFF)) {
++		    force_wake = 1;
++		    vgt_force_wake_get();
++	    }
++
++            req->data = 0;
++            switch ( req->size )
++            {
++            case 1:
++		req->data = *(uint8_t *)hva;
++		break;
++            case 2:
++		req->data = *(uint16_t *)hva;
++		break;
++            case 4:
++		req->data = *(uint32_t *)hva;
++		break;
++            case 8:
++                req->data = *(uint64_t *)hva;
++	        break;
++            default:
++	        ASSERT ( 0 );
++	        break;
++	    }
++
++	    if (force_wake) {
++		    vgt_force_wake_put();
++	    }
++        } // read
++        else
++        {
++	    int fifo_ret = 0;
++	    if (NEED_FORCE_WAKE(req->addr)) {
++		    force_wake = 1;
++		    fifo_ret = gen6_gt_wait_for_fifo();
++	    }
++
++            switch ( req->size )
++            {
++            case 1:
++		*(uint8_t *)hva = req->data;
++		break;
++            case 2:
++		*(uint16_t *)hva = req->data;
++		break;
++            case 4: *(uint32_t *)hva = req->data;
++		break;
++            case 8: *(uint64_t *)hva = req->data;
++		break;
++            default:
++	        ASSERT ( 0 );
++	        break;
++	    }
++	    if (fifo_ret) {
++		    gen6_gt_check_fifodbg();
++	    }
++        } // write
++
++	spin_unlock_irqrestore(&vgt_io_lock, flags);
++
++    } // mmio
++    else if (req->type == PV_IOREQ_TYPE_CTRL)
++    {
++        unsigned long flags;
++
++        spin_lock_irqsave(&vgt_io_lock, flags);
++
++        switch(req->addr)
++        {
++            case VGT_CTRL_FORCEWAKE_PUT:
++                if (force_wake_state == FORCE_WAKE_STATE_ON){
++                    vgt_force_wake_put();
++                    force_wake_state = FORCE_WAKE_STATE_OFF;
++                }
++                break;
++            case VGT_CTRL_FORCEWAKE_GET:
++                if (force_wake_state == FORCE_WAKE_STATE_OFF){
++                    vgt_force_wake_get();
++                    force_wake_state = FORCE_WAKE_STATE_ON;
++                }
++                break;
++            default:
++                rc = 0;
++                ASSERT(0);
++                break;
++        }
++
++        spin_unlock_irqrestore(&vgt_io_lock, flags);
++    }
++    else {
++        printk("%s: invalid type\n", __func__);
++        rc = 0;
++    }
++
++    return rc;
++}
++
++/*
++ * Take use of hypervisor selector in error code to indicate a
++ * vGT related event.
++ *
++ * P.S. will this cause any backward compatibility issue when
++ * __HYPERVISOR_CS is changed someday?
++ */
++void vgt_inject_virtual_exception(struct cpu_user_regs *regs, int pio)
++{
++	if (pio)
++		regs->error_code = __HYPERVISOR_CS + 4;
++	else
++		regs->error_code = __HYPERVISOR_CS;
++        do_guest_trap(TRAP_gp_fault, regs, 1);
++}
++
++int do_rsvd_page_fault(struct vcpu *v, unsigned long addr,
++                       struct cpu_user_regs *regs)
++{
++    l1_pgentry_t      pte;
++    int flags;
++
++    ASSERT ( v->domain == dom0 );
++    /* Only handle the fault triggered by delibrate reserved bit */
++    ASSERT ( (regs->error_code & (PFEC_page_present | PFEC_reserved_bit)) ==
++                                 (PFEC_page_present | PFEC_reserved_bit) );
++
++    /* Attempt to read the PTE that maps the VA being accessed. */
++    guest_get_eff_l1e ( v, addr, &pte );
++
++#if 1
++{
++    static long cnt = 0;
++    if (cnt++ < 1000)
++        VGT_DBG("vGT: captured %ldth rsvd fault (%lx, %lx)\n", cnt, addr, (l1e_get_pfn(pte) << PAGE_SHIFT) |  (addr & ~PAGE_MASK));
++}
++#endif
++
++    /* We're only looking for page fault purely caused by Xen */
++    flags = l1e_get_flags(pte);
++    if ( (regs->error_code & PFEC_insn_fetch) ||
++         ((regs->error_code & PFEC_write_access) && !(flags & _PAGE_RW)) ||
++         ((regs->error_code & PFEC_user_mode) && !(flags & _PAGE_USER)) )
++    {
++        VGT_LOG("vGT: return guest fault instead on %lx (%x, %x)\n", addr, regs->error_code, flags);
++        regs->error_code &= ~PFEC_reserved_bit;
++        goto bail;
++    }
++
++    vgt_inject_virtual_exception(regs, 0);
++    return EXCRET_fault_fixed;
++
++ bail:
++    return 0;
++}
++
++/* FIXME: change to static */
++int vgt_hvm_intercept_io(ioreq_t *p)
++{
++    p->is_vgt = 1;
++
++    /* return X86EMUL_UNHANDLEABLE to forward to dom0 vGT driver */
++    return X86EMUL_UNHANDLEABLE;
++}
++
++static int vgt_intercept_cf8_cfc(
++    int dir, uint32_t port, uint32_t bytes, uint32_t *val)
++{
++    struct domain *d = current->domain;
++    ioreq_t *p = get_ioreq(current);
++
++    if ( (port & ~3) == 0xcf8 )
++    {
++        if (bytes != 4){
++            printk("VGT_WARNING: vgt_intercept_cf8_cfc bytes=%d not 4 bytes\n", bytes);
++            return X86EMUL_OKAY;
++        }
++        if ((port & 3) != 0){
++            printk("VGT_WARNING: vgt_intercept_cf8_cfc port=0x%x not aligned\n", bytes);
++            return X86EMUL_OKAY;
++        }
++        if (dir == IOREQ_WRITE) {
++            /* Write */
++            d->arch.pci_cf8 = *val;
++            if ( CF8_to_BDF(d->arch.pci_cf8) == vgt_bdf )
++                return vgt_hvm_intercept_io(p);
++            else
++                return X86EMUL_UNHANDLEABLE;
++        }
++        else {
++            /* Read */
++            *val = d->arch.pci_cf8;
++            return X86EMUL_OKAY;
++        }
++    }
++    else {
++        /* CFC access */
++        if ( CF8_to_BDF(d->arch.pci_cf8) == vgt_bdf )
++        {
++            /* To vGT device */
++            return vgt_hvm_intercept_io(p);
++        }
++        /* To traditional Device Model */
++        return X86EMUL_UNHANDLEABLE;
++    }
++}
++
++int vgt_hvm_init(struct domain *d)
++{
++    /* register vGT PIO & MMIO handler */
++
++    ASSERT( is_hvm_domain(d) );
++
++    if ( vgt_enabled(d) )
++        return 0;
++
++    printk("Enable vGT for domain %d\n", d->domain_id);
++
++    d->arch.hvm_domain.vgt_enabled = 1;
++
++    register_portio_handler(d, 0xcf8, 8, vgt_intercept_cf8_cfc);
++
++    wp_htable(d) = xmalloc_bytes(WP_HASH_ENTRY_SIZE * WP_HASH_SIZE);
++    memset (wp_htable(d), 0, WP_HASH_ENTRY_SIZE * WP_HASH_SIZE);
++
++    ASSERT ( wp_htable(d) != NULL );
++
++    d->arch.hvm_domain.vgt_mmio_trap_range =
++        rangeset_new(d, "vGT MMIO Trap Range ", RANGESETF_prettyprint_hex);
++
++    ASSERT(d->arch.hvm_domain.vgt_mmio_trap_range);
++
++    /* FIXME: get the PIO & MMIO base&size */
++//  register_portio_handler(d, vgt_pio_base, vgt_pio_size, vgt_intercept_io);
++
++    return 0;
++}
++
++
++void vgt_hvm_deinit(struct domain *d)
++{
++    if (!vgt_enabled(d))
++        return;
++
++    rangeset_destroy(d->arch.hvm_domain.vgt_mmio_trap_range);
++    free_vgt_wp_hash( wp_htable(d) );
++    xfree ( wp_htable(d) );
++}
+diff --git a/xen/common/domain.c b/xen/common/domain.c
+index fac3470..317386f 100644
+--- a/xen/common/domain.c
++++ b/xen/common/domain.c
+@@ -248,8 +248,11 @@ struct domain *domain_create(
+     init_status |= INIT_rangeset;
+ 
+     d->iomem_caps = rangeset_new(d, "I/O Memory", RANGESETF_prettyprint_hex);
++    d->iomem_forward_caps = rangeset_new(d, "I/O Memory Forwarding",
++                                         RANGESETF_prettyprint_hex);
+     d->irq_caps   = rangeset_new(d, "Interrupts", 0);
+-    if ( (d->iomem_caps == NULL) || (d->irq_caps == NULL) )
++    if ( (d->iomem_caps == NULL) || (d->iomem_forward_caps == NULL)
++                                 || (d->irq_caps == NULL) )
+         goto fail;
+ 
+     if ( domcr_flags & DOMCRF_dummy )
+diff --git a/xen/common/keyhandler.c b/xen/common/keyhandler.c
+index 5072133..26d8dae 100644
+--- a/xen/common/keyhandler.c
++++ b/xen/common/keyhandler.c
+@@ -20,6 +20,7 @@
+ #include <xen/init.h>
+ #include <asm/debugger.h>
+ #include <asm/div64.h>
++#include <asm/hvm/support.h>
+ 
+ static struct keyhandler *key_table[256];
+ static unsigned char keypress_key;
+diff --git a/xen/common/rangeset.c b/xen/common/rangeset.c
+index f09c0c4..050a775 100644
+--- a/xen/common/rangeset.c
++++ b/xen/common/rangeset.c
+@@ -438,3 +438,18 @@ void rangeset_domain_printk(
+ 
+     spin_unlock(&d->rangesets_lock);
+ }
++
++void *first_range_ex(struct rangeset *r)
++{
++    return first_range(r);
++}
++
++void *get_range(struct rangeset *r, void *x,
++	unsigned long *s, unsigned long *e)
++{
++    struct range *y = x;
++
++    *s = y->s;
++    *e = y->e;
++    return next_range(r, y);
++}
+diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
+index d79464d..c1fd46b 100644
+--- a/xen/include/asm-x86/domain.h
++++ b/xen/include/asm-x86/domain.h
+@@ -214,7 +214,14 @@ struct paging_vcpu {
+ #define MAX_CPUID_INPUT 40
+ typedef xen_domctl_cpuid_t cpuid_input_t;
+ 
+-#define MAX_NESTEDP2M 10
++/*
++ * Adding new data structure into struct domain exceeds the PAGE_SIZE
++ * limitation, and extending to multiple page may be risky.
++ * We simpliy borrrow space from some unused data structures for now,
++ * and revisit some time later.
++ */
++//#define MAX_NESTEDP2M 10
++#define MAX_NESTEDP2M 1
+ struct p2m_domain;
+ struct time_scale {
+     int shift;
+@@ -251,6 +258,7 @@ struct arch_domain
+ 
+     /* I/O-port admin-specified access capabilities. */
+     struct rangeset *ioport_caps;
++    struct rangeset *ioport_forwarding_caps;
+     uint32_t pci_cf8;
+     uint8_t cmos_idx;
+ 
+diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
+index 27b3de5..da2e2b5 100644
+--- a/xen/include/asm-x86/hvm/domain.h
++++ b/xen/include/asm-x86/hvm/domain.h
+@@ -35,12 +35,37 @@
+ #include <public/hvm/params.h>
+ #include <public/hvm/save.h>
+ 
++struct vgt_trap_io {
++//    uint16_t  nr_pio_frags;
++//    struct trap_frags   pio_frags[2];
++    uint16_t  nr_mmio_frags;
++    struct trap_frags   mmio_frags[4];
++};
++
+ struct hvm_ioreq_page {
+     spinlock_t lock;
+     struct page_info *page;
+     void *va;
+ };
+ 
++struct wp_hash_table {
++    struct wp_hash_table *next;
++    unsigned long gpfn;
++};
++#define WP_HASH_SIZE_SHIFT   8
++#define WP_HASH_SIZE   (1 << WP_HASH_SIZE_SHIFT)
++#define wp_hash(x)     ((x) % WP_HASH_SIZE)
++#define WP_INVALID_GPFN      0
++#define WP_HASH_ENTRY_SIZE   sizeof(struct wp_hash_table)
++#define wp_htable(d)   (d->arch.hvm_domain.vgt_wp_hash_base)
++#define wp_htable_lock(d)   (d->arch.hvm_domain.vgt_wp_hash_lock)
++void vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn);
++void vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn);
++struct wp_hash_table *lookup_wp_hash_table(
++    struct wp_hash_table *wp_ht,
++    unsigned long gpfn);
++void free_vgt_wp_hash(struct wp_hash_table *wp_ht);
++
+ struct hvm_domain {
+     struct hvm_ioreq_page  ioreq;
+     struct hvm_ioreq_page  buf_ioreq;
+@@ -100,9 +125,14 @@ struct hvm_domain {
+         struct vmx_domain vmx;
+         struct svm_domain svm;
+     };
++    bool_t                  vgt_enabled;
++    struct rangeset *vgt_mmio_trap_range;
++    struct wp_hash_table   *vgt_wp_hash_base;
++    spinlock_t             vgt_wp_hash_lock;
+ };
+ 
+ #define hap_enabled(d)  ((d)->arch.hvm_domain.hap_enabled)
++#define vgt_enabled(d)  ((d)->arch.hvm_domain.vgt_enabled)
+ 
+ #endif /* __ASM_X86_HVM_DOMAIN_H__ */
+ 
+diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
+index 8408420..388b2db 100644
+--- a/xen/include/asm-x86/hvm/hvm.h
++++ b/xen/include/asm-x86/hvm/hvm.h
+@@ -194,6 +194,11 @@ struct hvm_function_table {
+                                 bool_t access_w, bool_t access_x);
+ };
+ 
++int vgt_domctl_add_range(struct domain *d, unsigned long gfn,
++        unsigned long mfn, unsigned long nr_mfns);
++int vgt_domctl_remove_range(struct domain *d, unsigned long gfn,
++        unsigned long mfn, unsigned long nr_mfns);
++
+ extern struct hvm_function_table hvm_funcs;
+ extern bool_t hvm_enabled;
+ extern bool_t cpu_has_lmsl;
+diff --git a/xen/include/asm-x86/hvm/io.h b/xen/include/asm-x86/hvm/io.h
+index 410a5f6..a237c71 100644
+--- a/xen/include/asm-x86/hvm/io.h
++++ b/xen/include/asm-x86/hvm/io.h
+@@ -70,8 +70,10 @@ extern const struct hvm_mmio_handler vlapic_mmio_handler;
+ extern const struct hvm_mmio_handler vioapic_mmio_handler;
+ extern const struct hvm_mmio_handler msixtbl_mmio_handler;
+ extern const struct hvm_mmio_handler iommu_mmio_handler;
++extern const struct hvm_mmio_handler vgt_mmio_handler;
++extern const struct hvm_mmio_handler writeprotection_handler;
+ 
+-#define HVM_MMIO_HANDLER_NR 5
++#define HVM_MMIO_HANDLER_NR 7
+ 
+ int hvm_io_intercept(ioreq_t *p, int type);
+ void register_io_handler(
+diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
+index e8b8cd7..cb091b0 100644
+--- a/xen/include/asm-x86/hvm/vcpu.h
++++ b/xen/include/asm-x86/hvm/vcpu.h
+@@ -170,6 +170,7 @@ struct hvm_vcpu {
+     struct hvm_trap     inject_trap;
+ 
+     struct viridian_vcpu viridian;
++    int    vgt_port; /* event channle port to notify dom0 vGT driver */
+ };
+ 
+ #endif /* __ASM_X86_HVM_VCPU_H__ */
+diff --git a/xen/include/asm-x86/iocap.h b/xen/include/asm-x86/iocap.h
+index 591ae17..dfb7958 100644
+--- a/xen/include/asm-x86/iocap.h
++++ b/xen/include/asm-x86/iocap.h
+@@ -14,6 +14,14 @@
+ #define ioports_access_permitted(d, s, e)               \
+     rangeset_contains_range((d)->arch.ioport_caps, s, e)
+ 
++#define ioports_permit_forwarding(d, s, e)              \
++    rangeset_add_range((d)->arch.ioport_forwarding_caps, s, e)
++#define ioports_forwarding_permitted(d, s, e)           \
++    rangeset_contains_range((d)->arch.ioport_forwarding_caps, s, e)
++#define ioports_forwarding_started(d)                   \
++    (!rangeset_is_empty((d)->arch.ioport_forwarding_caps))
++
++
+ #define cache_flush_permitted(d)                        \
+     (!rangeset_is_empty((d)->iomem_caps) ||             \
+      !rangeset_is_empty((d)->arch.ioport_caps))
+diff --git a/xen/include/asm-x86/p2m.h b/xen/include/asm-x86/p2m.h
+index 43583b2..2656de0 100644
+--- a/xen/include/asm-x86/p2m.h
++++ b/xen/include/asm-x86/p2m.h
+@@ -70,6 +70,7 @@ typedef enum {
+     p2m_ram_paging_in = 11,       /* Memory that is being paged in */
+     p2m_ram_shared = 12,          /* Shared or sharable memory */
+     p2m_ram_broken = 13,          /* Broken page, access cause domain crash */
++    p2m_writeprotection = 14,     /* write-protection guest PPGTT PT pages */
+ } p2m_type_t;
+ 
+ /*
+@@ -656,6 +657,8 @@ void p2m_flush_nestedp2m(struct domain *d);
+ void nestedp2m_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
+     l1_pgentry_t *p, mfn_t table_mfn, l1_pgentry_t new, unsigned int level);
+ 
++int hap_write_protect_pages(struct domain *d,
++    unsigned long *gpfn, int num, int wr);
+ #endif /* _XEN_P2M_H */
+ 
+ /*
+diff --git a/xen/include/asm-x86/page.h b/xen/include/asm-x86/page.h
+index 998a0c7..0812f44 100644
+--- a/xen/include/asm-x86/page.h
++++ b/xen/include/asm-x86/page.h
+@@ -71,6 +71,10 @@
+ #define l4e_get_pfn(x)             \
+     ((unsigned long)(((x).l4 & (PADDR_MASK&PAGE_MASK)) >> PAGE_SHIFT))
+ 
++/* Get reserved bits mapped by pte(unsigned long) */
++#define l1e_get_rsvd(x)            \
++    ((unsigned long)(((x).l1 & (PRSVD_MASK&(~PADDR_MASK)))))
++
+ /* Get physical address of page mapped by pte (paddr_t). */
+ #define l1e_get_paddr(x)           \
+     ((paddr_t)(((x).l1 & (PADDR_MASK&PAGE_MASK))))
+@@ -157,6 +161,12 @@ static inline l4_pgentry_t l4e_from_paddr(paddr_t pa, unsigned int flags)
+ #define l3e_remove_flags(x, flags) ((x).l3 &= ~put_pte_flags(flags))
+ #define l4e_remove_flags(x, flags) ((x).l4 &= ~put_pte_flags(flags))
+ 
++/* Add extra reserved bits to an existing pte */
++#define l1e_add_rsvd(x, bits)      ((x).l1 |= (bits))
++
++/* Remove reserved bits from an existing pte */
++#define l1e_remove_rsvd(x, bits)   ((x).l1 &= ~(bits))
++
+ /* Check if a pte's page mapping or significant access flags have changed. */
+ #define l1e_has_changed(x,y,flags) \
+     ( !!(((x).l1 ^ (y).l1) & ((PADDR_MASK&PAGE_MASK)|put_pte_flags(flags))) )
+@@ -167,6 +177,10 @@ static inline l4_pgentry_t l4e_from_paddr(paddr_t pa, unsigned int flags)
+ #define l4e_has_changed(x,y,flags) \
+     ( !!(((x).l4 ^ (y).l4) & ((PADDR_MASK&PAGE_MASK)|put_pte_flags(flags))) )
+ 
++/* Check if a pte's reserved bits have changed */
++#define l1e_has_changed_rsvd(x,y,bits) \
++    ( !!(((x).l1 ^ (y).l1) & ((PRSVD_MASK&(~PADDR_MASK))|(bits))) )
++
+ /* Pagetable walking. */
+ #define l2e_to_l1e(x)              ((l1_pgentry_t *)__va(l2e_get_paddr(x)))
+ #define l3e_to_l2e(x)              ((l2_pgentry_t *)__va(l3e_get_paddr(x)))
+diff --git a/xen/include/asm-x86/traps.h b/xen/include/asm-x86/traps.h
+index 82cbcee..5420920 100644
+--- a/xen/include/asm-x86/traps.h
++++ b/xen/include/asm-x86/traps.h
+@@ -32,6 +32,8 @@ extern void machine_check_vector(struct cpu_user_regs *regs, long error_code);
+ 
+ void async_exception_cleanup(struct vcpu *);
+  
++extern void do_guest_trap(
++    int trapnr, const struct cpu_user_regs *regs, int use_error_code);
+ /**
+  * guest_has_trap_callback
+  *
+diff --git a/xen/include/asm-x86/vgt.h b/xen/include/asm-x86/vgt.h
+new file mode 100644
+index 0000000..56d09c4
+--- /dev/null
++++ b/xen/include/asm-x86/vgt.h
+@@ -0,0 +1,39 @@
++/*
++ * vgt.h: vGT related definitions
++ * Copyright (c) 2011, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
++ * Place - Suite 330, Boston, MA 02111-1307 USA.
++ *
++ */
++#ifndef __ASM_X86_VGT_H__
++#define __ASM_X86_VGT_H__
++
++extern int set_vgt_info(unsigned int gen_dev_bdf, unsigned int gen_dev_type);
++extern int vgt_hvm_init(struct domain *d);
++extern void vgt_hvm_deinit(struct domain *d);
++extern int hypercall_io_emulation(struct vcpu *v, struct vcpu_emul_ioreq *req);
++extern int hypercall_get_sysdata(struct vcpu *v,
++		struct vcpu_sysdata_request *req);
++extern int do_rsvd_page_fault(struct vcpu *v, unsigned long addr,
++                       struct cpu_user_regs *regs);
++extern void vgt_inject_virtual_exception(struct cpu_user_regs *regs, int pio);
++extern int vgt_set_mmio_trap(struct domain *d, unsigned long mfn_start, unsigned long mfn_end);
++
++int vgt_hvm_intercept_io(ioreq_t *p);
++
++#define CF8_to_BDF(cf8)    (((unsigned int)(cf8) >> 8) & 0xffff)
++extern unsigned int vgt_bdf;
++#endif // __ASM_X86_VGT_H__
++
++
+diff --git a/xen/include/asm-x86/x86_64/page.h b/xen/include/asm-x86/x86_64/page.h
+index c193c88..5ee47fd 100644
+--- a/xen/include/asm-x86/x86_64/page.h
++++ b/xen/include/asm-x86/x86_64/page.h
+@@ -22,10 +22,24 @@
+ #define __PAGE_OFFSET           DIRECTMAP_VIRT_START
+ #define __XEN_VIRT_START        XEN_VIRT_START
+ 
+-/* These are architectural limits. Current CPUs support only 40-bit phys. */
+-#define PADDR_BITS              52
++/*
++ * These are architectural limits. Current CPUs support only 40-bit phys.
++ *
++ * There's a requirement to trap-and-emulate MMIO from PV guest (such as
++ * in vGT), so we adopt an approach by using reserved bit to trap concerned
++ * MMIO ranges. That means we need reserve some highest bits under
++ * architectural limit for that purpose. Currently only one reserved bit is
++ * stolen here, and it should work well on client platforms for quite a long
++ * time. It should be enough to come up other architectural innovation before
++ * all bits are supported by CPUs, if this usage continues to be appealing.
++ * :-)
++ */
++#define PADDR_ARCH_BITS         52
++#define PRSVD_BITS              PADDR_ARCH_BITS
++#define PADDR_BITS              51
+ #define VADDR_BITS              48
+ #define PADDR_MASK              ((1UL << PADDR_BITS)-1)
++#define PRSVD_MASK              ((1UL << PRSVD_BITS)-1)
+ #define VADDR_MASK              ((1UL << VADDR_BITS)-1)
+ 
+ #define is_canonical_address(x) (((long)(x) >> 47) == ((long)(x) >> 63))
+@@ -161,6 +175,9 @@ typedef l4_pgentry_t root_pgentry_t;
+ /* Bit 22 of a 24-bit flag mask. This corresponds to bit 62 of a pte.*/
+ #define _PAGE_GNTTAB (1U<<22)
+ 
++/* Bit 51 of the pte, as the indicator for MMIO trap-and-emulation */
++#define _PAGE_FORWARD (1UL<<51)
++
+ #define PAGE_HYPERVISOR         (__PAGE_HYPERVISOR         | _PAGE_GLOBAL)
+ #define PAGE_HYPERVISOR_NOCACHE (__PAGE_HYPERVISOR_NOCACHE | _PAGE_GLOBAL)
+ 
+diff --git a/xen/include/public/hvm/e820.h b/xen/include/public/hvm/e820.h
+index 5bdc227..683f091 100644
+--- a/xen/include/public/hvm/e820.h
++++ b/xen/include/public/hvm/e820.h
+@@ -27,7 +27,7 @@
+ #define HVM_E820_NR_OFFSET   0x000001E8
+ #define HVM_E820_OFFSET      0x000002D0
+ 
+-#define HVM_BELOW_4G_RAM_END        0xF0000000
++#define HVM_BELOW_4G_RAM_END        0xC0000000
+ #define HVM_BELOW_4G_MMIO_START     HVM_BELOW_4G_RAM_END
+ #define HVM_BELOW_4G_MMIO_LENGTH    ((1ULL << 32) - HVM_BELOW_4G_MMIO_START)
+ 
+diff --git a/xen/include/public/hvm/hvm_op.h b/xen/include/public/hvm/hvm_op.h
+index a9aab4b..df23807 100644
+--- a/xen/include/public/hvm/hvm_op.h
++++ b/xen/include/public/hvm/hvm_op.h
+@@ -270,6 +270,47 @@ struct xen_hvm_inject_msi {
+ typedef struct xen_hvm_inject_msi xen_hvm_inject_msi_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_hvm_inject_msi_t);
+ 
++#define HVMOP_vgt_set_trap_io       17
++struct xen_hvm_vgt_set_trap_io {
++    domid_t  domid;
++    uint16_t nr_pio_frags;
++    struct trap_frags	pio_frags[MAX_TRAP_FRAGS];
++    uint16_t nr_mmio_frags;
++    struct trap_frags	mmio_frags[MAX_TRAP_FRAGS];
++};
++typedef struct xen_hvm_vgt_set_trap_io xen_hvm_vgt_set_trap_io_t;
++DEFINE_XEN_GUEST_HANDLE(xen_hvm_vgt_set_trap_io_t);
++
++#define HVMOP_vgt_map_mmio           18
++struct xen_hvm_vgt_map_mmio {
++	uint16_t  domid;
++    uint16_t  map;		/* 1: Map, 0: Unmap */
++    uint32_t  nr_mfns;
++    uint64_t  first_gfn;
++    uint64_t  first_mfn;
++};
++typedef struct xen_hvm_vgt_map_mmio xen_hvm_vgt_map_mmio_t;
++DEFINE_XEN_GUEST_HANDLE(xen_hvm_vgt_map_mmio_t);
++
++#define HVMOP_vgt_enable           19
++struct xen_hvm_vgt_enable {
++	uint16_t  domid;
++};
++typedef struct xen_hvm_vgt_enable xen_hvm_vgt_enable_t;
++DEFINE_XEN_GUEST_HANDLE(xen_hvm_vgt_enable_t);
++
++#define HVMOP_vgt_wp_pages         20  /* writeprotection to guest pages */
++struct xen_hvm_vgt_wp_pages {
++#define MAX_WP_BATCH_PAGES         128
++    domid_t  domid;
++    uint16_t set;            /* 1: set WP, 0: remove WP */
++    uint16_t nr_pages;
++    unsigned long  wp_pages[MAX_WP_BATCH_PAGES];
++};
++typedef struct xen_hvm_vgt_wp_pages xen_hvm_vgt_wp_pages_t;
++DEFINE_XEN_GUEST_HANDLE(xen_hvm_vgt_wp_pages_t);
++
++
+ #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
+ 
+ #endif /* __XEN_PUBLIC_HVM_HVM_OP_H__ */
+diff --git a/xen/include/public/hvm/ioreq.h b/xen/include/public/hvm/ioreq.h
+index f05d130..c1a215a 100644
+--- a/xen/include/public/hvm/ioreq.h
++++ b/xen/include/public/hvm/ioreq.h
+@@ -54,8 +54,9 @@ struct ioreq {
+                              * of the real data to use. */
+     uint8_t dir:1;          /* 1=read, 0=write */
+     uint8_t df:1;
+-    uint8_t _pad1:1;
++    uint8_t is_vgt:1;       /* if 1, it is vGT I/O request */
+     uint8_t type;           /* I/O type */
++    uint32_t vgt_eport;     /* evtchn for notification to/from vGT driver */
+ };
+ typedef struct ioreq ioreq_t;
+ 
+diff --git a/xen/include/public/memory.h b/xen/include/public/memory.h
+index 7a26dee..a3d3611 100644
+--- a/xen/include/public/memory.h
++++ b/xen/include/public/memory.h
+@@ -461,6 +461,29 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_op_t);
+ 
+ #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
+ 
++/*
++ * Translate the given guest PFNs to MFNs
++ */
++#define XENMEM_get_mfn_from_pfn    25
++struct xen_get_mfn_from_pfn {
++    /*
++     * Pointer to buffer to fill with list of pfn.
++     * for IN, it contains the guest PFN that need to translated
++     * for OUT, it contains the translated MFN. or INVALID_MFN if no valid translation
++     */
++    XEN_GUEST_HANDLE(xen_pfn_t) pfn_list;
++
++    /*
++     * IN: Size of the pfn_array.
++     */
++    unsigned int nr_pfns;
++
++    /* IN: which domain */
++    domid_t domid;
++};
++typedef struct xen_get_mfn_from_pfn xen_get_mfn_from_pfn_t;
++DEFINE_XEN_GUEST_HANDLE(xen_get_mfn_from_pfn_t);
++
+ #endif /* __XEN_PUBLIC_MEMORY_H__ */
+ 
+ /*
+diff --git a/xen/include/public/platform.h b/xen/include/public/platform.h
+index 4341f54..7688c8b 100644
+--- a/xen/include/public/platform.h
++++ b/xen/include/public/platform.h
+@@ -527,6 +527,20 @@ struct xenpf_core_parking {
+ typedef struct xenpf_core_parking xenpf_core_parking_t;
+ DEFINE_XEN_GUEST_HANDLE(xenpf_core_parking_t);
+ 
++#define XENPF_set_vgt_info    61
++
++#define XEN_IGD_INVALID 0
++#define XEN_IGD_SNB     1
++#define XEN_IGD_IVB     2
++#define XEN_IGD_HSW     3
++#define XEN_IGD_MAX     3   /* the max GEN dev type supported */
++struct xenpf_vgt_info {
++    unsigned int gen_dev_bdf;
++    unsigned int gen_dev_type;
++};
++typedef struct xenpf_vgt_info xenpf_vgt_info_t;
++DEFINE_XEN_GUEST_HANDLE(xenpf_vgt_info_t);
++
+ /*
+  * ` enum neg_errnoval
+  * ` HYPERVISOR_platform_op(const struct xen_platform_op*);
+@@ -553,6 +567,7 @@ struct xen_platform_op {
+         struct xenpf_cpu_hotadd        cpu_add;
+         struct xenpf_mem_hotadd        mem_add;
+         struct xenpf_core_parking      core_parking;
++        struct xenpf_vgt_info          vgt_info;
+         uint8_t                        pad[128];
+     } u;
+ };
+diff --git a/xen/include/public/vcpu.h b/xen/include/public/vcpu.h
+index e888daf..fa493d8 100644
+--- a/xen/include/public/vcpu.h
++++ b/xen/include/public/vcpu.h
+@@ -227,6 +227,66 @@ struct vcpu_register_time_memory_area {
+ typedef struct vcpu_register_time_memory_area vcpu_register_time_memory_area_t;
+ DEFINE_XEN_GUEST_HANDLE(vcpu_register_time_memory_area_t);
+ 
++/* Request an I/O emulation for the specified VCPU. */
++#define VCPUOP_request_io_emulation       14
++
++#define PV_IOREQ_READ      1
++#define PV_IOREQ_WRITE     0
++
++#define PV_IOREQ_TYPE_PIO          0 /* pio */
++#define PV_IOREQ_TYPE_COPY         1 /* mmio ops */
++#define PV_IOREQ_TYPE_CTRL         2 /* vGT control ops */
++
++/* for "addr" field , when "type" is PV_IOREQ_TYPE_CTRL */
++#define VGT_CTRL_FORCEWAKE_GET  0
++#define VGT_CTRL_FORCEWAKE_PUT  1
++
++struct vcpu_emul_ioreq {
++    uint64_t      addr;           /* physical address */
++    uint64_t      data;           /* data (or paddr of data) */
++    uint64_t      count;          /* for rep prefixes */
++    uint32_t      size;           /* size in bytes */
++    uint16_t      _pad0;
++    uint8_t       state:4;
++    uint8_t       data_is_ptr:1;  /* if 1, data above is the guest paddr
++                                   * of the real data to use. */
++    uint8_t       dir:1;          /* 1=read, 0=write */
++    uint8_t       df:1;
++    uint8_t       _pad1:1;
++    uint8_t       type;           /* I/O type */
++};
++typedef struct vcpu_emul_ioreq vcpu_emul_ioreq_t;
++DEFINE_XEN_GUEST_HANDLE(vcpu_emul_ioreq_t);
++
++/* Activate I/O self-forwarding for the specified VCPU */
++#define VCPUOP_start_io_forward           15
++struct vcpu_io_forwarding_request {
++    int16_t      nr_pio_frags;
++    struct trap_frags	  pio_frags[MAX_TRAP_FRAGS];
++    int16_t      nr_mmio_frags;  /* 0..max-1, -1 means let VMM fill */
++    struct trap_frags	  mmio_frags[MAX_TRAP_FRAGS];	/*s/e address */
++};
++
++#define VCPUOP_get_sysdata           16
++/* sub operations */
++#define VCPUOP_sysdata_get_segment   0
++#define VCPUOP_sysdata_read	     1
++struct vcpu_sysdata_request {
++    uint64_t      op_type;
++    union {
++	struct {
++	    uint32_t     selector;
++            uint32_t     pad1;
++	    uint64_t     xdt_desc[2];
++		/* System descriptors uses 2 descriptors in IA32e */
++	} seg;
++	struct {
++	    uint64_t     src_addr;	/* linear address */
++            uint64_t     sys_data;
++            uint32_t     bytes;
++	} rd;
++    } ops;
++};
+ #endif /* __XEN_PUBLIC_VCPU_H__ */
+ 
+ /*
+diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
+index 3cab74f..a342657 100644
+--- a/xen/include/public/xen.h
++++ b/xen/include/public/xen.h
+@@ -789,6 +789,13 @@ struct xen_multiboot_mod_list
+     /* Unused, must be zero */
+     uint32_t pad;
+ };
++
++struct trap_frags {
++    uint64_t   s;   /* start address */
++    uint64_t   e;   /* end address */
++};
++#define MAX_TRAP_FRAGS	32
++
+ /*
+  * `incontents 200 startofday_dom0_console Dom0_console
+  *
+diff --git a/xen/include/xen/iocap.h b/xen/include/xen/iocap.h
+index b755ecb..16a88be 100644
+--- a/xen/include/xen/iocap.h
++++ b/xen/include/xen/iocap.h
+@@ -17,6 +17,13 @@
+ #define iomem_access_permitted(d, s, e)                 \
+     rangeset_contains_range((d)->iomem_caps, s, e)
+ 
++#define iomem_permit_forward(d, s, e)                   \
++    rangeset_add_range((d)->iomem_forward_caps, s, e)
++#define iomem_deny_forward(d, s, e)                   \
++    rangeset_remove_range((d)->iomem_forward_caps, s, e)
++#define iomem_forward_permitted(d, s, e)                \
++    rangeset_contains_range((d)->iomem_forward_caps, s, e)
++
+ #define irq_permit_access(d, i)                         \
+     rangeset_add_singleton((d)->irq_caps, i)
+ #define irq_deny_access(d, i)                           \
+diff --git a/xen/include/xen/rangeset.h b/xen/include/xen/rangeset.h
+index 1e16a6b..9d51aa4 100644
+--- a/xen/include/xen/rangeset.h
++++ b/xen/include/xen/rangeset.h
+@@ -73,4 +73,8 @@ void rangeset_printk(
+ void rangeset_domain_printk(
+     struct domain *d);
+ 
++void *first_range_ex(struct rangeset *r);
++void *get_range(struct rangeset *r, void *y,
++	unsigned long *s, unsigned long *e);
++
+ #endif /* __XEN_RANGESET_H__ */
+diff --git a/xen/include/xen/sched.h b/xen/include/xen/sched.h
+index ae6a3b8..8f7b255 100644
+--- a/xen/include/xen/sched.h
++++ b/xen/include/xen/sched.h
+@@ -284,6 +284,7 @@ struct domain
+     /* I/O capabilities (access to IRQs and memory-mapped I/O). */
+     struct rangeset *iomem_caps;
+     struct rangeset *irq_caps;
++    struct rangeset *iomem_forward_caps;
+ 
+     /* Is this an HVM guest? */
+     bool_t           is_hvm;
