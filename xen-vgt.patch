@@ -71,7 +71,7 @@ index 6641197..09ab9a9 100644
  
  extern unsigned long pci_mem_start, pci_mem_end;
 diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
-index 627e8cb..be80f9d 100644
+index 627e8cb..4c1ae07 100644
 --- a/tools/firmware/hvmloader/pci.c
 +++ b/tools/firmware/hvmloader/pci.c
 @@ -24,6 +24,7 @@
@@ -82,7 +82,16 @@ index 627e8cb..be80f9d 100644
  
  #include <xen/memory.h>
  #include <xen/hvm/ioreq.h>
-@@ -111,30 +112,53 @@ void pci_setup(void)
+@@ -36,6 +37,8 @@ unsigned long pci_mem_end = PCI_MEM_END;
+ enum virtual_vga virtual_vga = VGA_none;
+ unsigned long igd_opregion_pgbase = 0;
+ 
++static int is_vgt = 0;
++
+ void pci_setup(void)
+ {
+     uint8_t is_64bar, using_64bar, bar64_relocate = 0;
+@@ -111,30 +114,55 @@ void pci_setup(void)
          ASSERT((devfn != PCI_ISA_DEVFN) ||
                 ((vendor_id == 0x8086) && (device_id == 0x7000)));
  
@@ -121,6 +130,8 @@ index 627e8cb..be80f9d 100644
 +                    printf("Found VGT\n");
 +                    vga_devfn = devfn;
 +                    virtual_vga = VGA_std;
++
++                    is_vgt = 1;
 +                }
 +                else
 +                {
@@ -140,7 +151,7 @@ index 627e8cb..be80f9d 100644
                       * and map the OpRegion at the give address.
                       */
                      pci_writel(vga_devfn, PCI_INTEL_OPREGION,
-@@ -272,6 +296,13 @@ void pci_setup(void)
+@@ -272,6 +300,13 @@ void pci_setup(void)
              unsigned int,
              hvm_info->low_mem_pgend - (pci_mem_start >> PAGE_SHIFT),
              (1u << 16) - 1);
@@ -154,6 +165,23 @@ index 627e8cb..be80f9d 100644
          if ( hvm_info->high_mem_pgend == 0 )
              hvm_info->high_mem_pgend = 1ull << (32 - PAGE_SHIFT);
          hvm_info->low_mem_pgend -= nr_pages;
+@@ -308,6 +343,16 @@ void pci_setup(void)
+     io_resource.base = 0xc000;
+     io_resource.max = 0x10000;
+ 
++
++    /* XXX: we use this hack to tell vGT driver the top of <4G mem, so vGT
++     * can avoid unnecessary attempts to map the mem hole. This optimization
++     * can speed up guest bootup time and improve Win7 SMP guest's stability.
++     * NOTE: here we're actually trying to write 32 bits into VENDOR_ID and
++     * DEVICE_ID -- we assume normally sane codes in guest won't do this...
++     */
++    if ( is_vgt )
++        pci_writel(vga_devfn, PCI_VENDOR_ID, hvm_info->low_mem_pgend);
++
+     /* Assign iomem and ioport resources in descending order of size. */
+     for ( i = 0; i < nr_bars; i++ )
+     {
 diff --git a/tools/firmware/hvmloader/seabios.c b/tools/firmware/hvmloader/seabios.c
 index f17e67b..98fb9af 100644
 --- a/tools/firmware/hvmloader/seabios.c
@@ -316,15 +344,36 @@ index 0000000..222ee64
 +}
 +
 +#endif  /* _VGT_DEVTABLE_H */
+diff --git a/tools/firmware/vgabios/Makefile b/tools/firmware/vgabios/Makefile
+index 26bb871..6ff921b 100644
+--- a/tools/firmware/vgabios/Makefile
++++ b/tools/firmware/vgabios/Makefile
+@@ -37,7 +37,7 @@ release:
+ 	tar czvf ../$(RELEASE).tgz --exclude CVS -C .. $(RELEASE)/
+ 
+ vgabios.bin: biossums vgabios.c vgabios.h vgafonts.h vgatables.h vbe.h vbe.c vbetables.h
+-	$(GCC) -E -P vgabios.c $(VGABIOS_VERS) -DVBE $(VGABIOS_DATE) > _vgabios_.c
++	$(GCC) -E -P vgabios.c $(VGABIOS_VERS) -DVBE -DVGT $(VGABIOS_DATE) > _vgabios_.c
+ 	$(BCC) -o vgabios.s -C-c -D__i86__ -S -0 _vgabios_.c
+ 	sed -e 's/^\.text//' -e 's/^\.data//' vgabios.s > _vgabios_.s
+ 	$(AS86) _vgabios_.s -b vgabios.bin -u -w- -g -0 -j -O -l vgabios.txt
+@@ -47,7 +47,7 @@ vgabios.bin: biossums vgabios.c vgabios.h vgafonts.h vgatables.h vbe.h vbe.c vbe
+ 	ls -l VGABIOS-lgpl-latest.bin
+ 
+ vgabios.debug.bin: biossums vgabios.c vgabios.h vgafonts.h vgatables.h vbe.h vbe.c vbetables.h
+-	$(GCC) -E -P vgabios.c $(VGABIOS_VERS) -DVBE -DDEBUG $(VGABIOS_DATE) > _vgabios-debug_.c
++	$(GCC) -E -P vgabios.c $(VGABIOS_VERS) -DVBE -DVGT -DDEBUG $(VGABIOS_DATE) > _vgabios-debug_.c
+ 	$(BCC) -o vgabios-debug.s -C-c -D__i86__ -S -0 _vgabios-debug_.c
+ 	sed -e 's/^\.text//' -e 's/^\.data//' vgabios-debug.s > _vgabios-debug_.s
+ 	$(AS86) _vgabios-debug_.s -b vgabios.debug.bin -u -w- -g -0 -j -O -l vgabios.debug.txt
 diff --git a/tools/firmware/vgabios/vgabios.c b/tools/firmware/vgabios/vgabios.c
-index a9dbe00..58110c5 100644
+index a9dbe00..c81d7cd 100644
 --- a/tools/firmware/vgabios/vgabios.c
 +++ b/tools/firmware/vgabios/vgabios.c
-@@ -149,6 +149,13 @@ vgabios_entry_point:
+@@ -149,6 +149,12 @@ vgabios_entry_point:
             
    jmp vgabios_init_func
  
-+#define VGT
 +/*
 + * GEN Windows driver assume the identifying string
 + * to be located from the VBIOS offset 6.
@@ -334,7 +383,7 @@ index a9dbe00..58110c5 100644
  #ifdef PCIBIOS
  .org 0x18
  .word vgabios_pci_data
-@@ -158,6 +165,7 @@ vgabios_entry_point:
+@@ -158,6 +164,7 @@ vgabios_entry_point:
  .org 0x1e
  .ascii  "IBM"
  .byte   0x00
@@ -630,8 +679,29 @@ index d502bdf..e8a3c4b 100644
  
  obj-$(crash_debug) += gdbstub.o
  
+diff --git a/xen/arch/x86/acpi/power.c b/xen/arch/x86/acpi/power.c
+index f41f0de..d36b93f 100644
+--- a/xen/arch/x86/acpi/power.c
++++ b/xen/arch/x86/acpi/power.c
+@@ -30,6 +30,7 @@
+ #include <asm/apic.h>
+ #include <asm/io_apic.h>
+ #include <acpi/cpufreq/cpufreq.h>
++#include <asm/vgt.h>
+ 
+ uint32_t system_reset_counter = 1;
+ 
+@@ -73,6 +74,8 @@ static void device_power_up(void)
+     time_resume();
+ 
+     console_resume();
++
++    vgt_resume();
+ }
+ 
+ static void freeze_domains(void)
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 52c9040..9d32379 100644
+index 52c9040..22a5d06 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
 @@ -60,6 +60,7 @@
@@ -660,7 +730,7 @@ index 52c9040..9d32379 100644
          rc = -ENOMEM;
          if ( d->arch.ioport_caps == NULL )
              goto fail;
-@@ -1020,6 +1025,145 @@ arch_do_vcpu_op(
+@@ -1020,6 +1025,48 @@ arch_do_vcpu_op(
          break;
      }
  
@@ -681,103 +751,6 @@ index 52c9040..9d32379 100644
 +        rc = -EFAULT;
 +        if ( copy_to_guest(arg, &ioreq, 1) )
 +            break;
-+        rc = 0;
-+        break;
-+    }
-+
-+    case VCPUOP_start_io_forward:
-+    {
-+        struct vcpu_io_forwarding_request req;
-+        int query = 0;
-+        unsigned long s, e;
-+        int i;
-+        rc = -EFAULT;
-+
-+        if ( dom0 != v->domain )  /* only for dom0 */
-+            break;
-+
-+        if ( copy_from_guest(&req, arg, 1) )
-+            break;
-+
-+        printk("vGT: start I/O PIO %d s %lx e %lx\n",
-+            req.nr_pio_frags,
-+            (long)req.pio_frags[0].s,
-+            (long)req.pio_frags[0].e);
-+        printk("vGT: start I/O MMIO %d s %lx e %lx\n",
-+            req.nr_mmio_frags,
-+            (long)req.mmio_frags[0].s,
-+            (long)req.mmio_frags[0].e);
-+
-+        if ( req.nr_pio_frags == -1 )
-+        {
-+                struct rangeset *r = v->domain->arch.ioport_forwarding_caps;
-+                void *y = first_range_ex(r);
-+                for ( i = 0; y != NULL && i < MAX_TRAP_FRAGS; i++ )
-+                {
-+                        y = get_range(r, y, &s, &e);
-+                        req.pio_frags[i].s = s;
-+                        req.pio_frags[i].e = e;
-+                }
-+                req.nr_pio_frags = i;
-+                query = 1;
-+                printk("VGT: PIO retrieves configurations:"
-+                        " frags %d s %lx e %lx\n",
-+                        req.nr_pio_frags,
-+                        req.pio_frags[0].s,
-+                        req.pio_frags[0].e);
-+
-+        } else {
-+            for ( i = 0; i < req.nr_pio_frags; i++ )
-+            {
-+                if ( 0 != ioports_permit_forwarding(v->domain,
-+                        req.pio_frags[i].s,
-+                        req.pio_frags[i].e) )
-+                {
-+                    printk("VGT: PIO set trap region failed %d\n", i);
-+                    break;
-+                }
-+            }
-+        }
-+
-+        if ( req.nr_mmio_frags == -1 )
-+        {
-+            struct rangeset *r = v->domain->iomem_forward_caps;
-+            void *y = first_range_ex(r);
-+
-+            for ( i = 0; y != NULL && i < MAX_TRAP_FRAGS; i++ )
-+            {
-+                y = get_range(r, y, &s, &e);
-+                req.mmio_frags[i].s = s << PAGE_SHIFT;
-+                req.mmio_frags[i].e = e << PAGE_SHIFT;
-+            }
-+            req.nr_mmio_frags = i;
-+            query = 1;
-+            printk("VGT: MMIO retrieves configurations:"
-+                    " frags %d s %lx e %lx\n",
-+                    req.nr_mmio_frags,
-+                    req.mmio_frags[0].s,
-+                    req.mmio_frags[0].e);
-+
-+        } else {
-+            for ( i = 0; i < req.nr_mmio_frags; i++ )
-+            {
-+                if ( (req.mmio_frags[i].s & ~PAGE_MASK) != 0 ||
-+                    (req.mmio_frags[i].e & ~PAGE_MASK) != 0)
-+                {
-+                    printk("VGT: MMIO frags %d not page aligned\n", i);
-+                    break;
-+                }
-+
-+                if ( vgt_set_mmio_trap(v->domain,
-+                    req.mmio_frags[i].s >> PAGE_SHIFT,
-+                    req.mmio_frags[i].e >> PAGE_SHIFT) != 0 )
-+                    break;
-+            }
-+        }
-+
-+        if ( query && copy_to_guest(arg, &req, 1) )
-+                break;
-+
 +        rc = 0;
 +        break;
 +    }
@@ -819,10 +792,18 @@ index 03fe845..2e83ea2 100644
  #include <public/version.h>
  
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index c2a04c4..482b130 100644
+index c2a04c4..016a103 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
-@@ -641,7 +641,8 @@ long arch_do_domctl(
+@@ -35,6 +35,7 @@
+ #include <asm/mem_sharing.h>
+ #include <asm/xstate.h>
+ #include <asm/debugger.h>
++#include <asm/vgt.h>
+ 
+ static int gdbsx_guest_mem_io(
+     domid_t domid, struct xen_domctl_gdbsx_memio *iop)
+@@ -641,7 +642,8 @@ long arch_do_domctl(
          if ( ret )
              break;
  
@@ -832,6 +813,26 @@ index c2a04c4..482b130 100644
          {
              printk(XENLOG_G_INFO
                     "memory_map:add: dom%d gfn=%lx mfn=%lx nr=%lx\n",
+@@ -1214,6 +1216,19 @@ long arch_do_domctl(
+     }
+     break;
+ 
++    case XEN_DOMCTL_vgt_io_trap:
++    {
++	    struct xen_domctl_vgt_io_trap *info = &domctl->u.vgt_io_trap;
++
++	    if (!info->n_pio || !info->n_mmio)
++		    copyback = 1;
++
++	    ret = vgt_io_trap(d, info);
++	    if (ret)
++		    break;
++    }
++    break;
++
+     default:
+         ret = iommu_do_domctl(domctl, d, u_domctl);
+         break;
 diff --git a/xen/arch/x86/hvm/Makefile b/xen/arch/x86/hvm/Makefile
 index eea5555..765a09f 100644
 --- a/xen/arch/x86/hvm/Makefile
@@ -845,19 +846,188 @@ index eea5555..765a09f 100644
 +obj-y += vpmu.o
 +obj-y += vgt.o
 diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
-index 9bfba48..259d5bb 100644
+index 9bfba48..9ea1191 100644
 --- a/xen/arch/x86/hvm/emulate.c
 +++ b/xen/arch/x86/hvm/emulate.c
-@@ -181,6 +181,7 @@ static int hvmemul_do_io(
-     p->count = *reps;
+@@ -61,6 +61,7 @@ static int hvmemul_do_io(
+     unsigned long ram_gfn = paddr_to_pfn(ram_gpa);
+     p2m_type_t p2mt;
+     struct page_info *ram_page;
++    int do_mmio_split = (is_mmio && !value_is_ptr && size > sizeof(p->data));
+     int rc;
+ 
+     /* Check for paged out page */
+@@ -83,25 +84,62 @@ static int hvmemul_do_io(
+      * Weird-sized accesses have undefined behaviour: we discard writes
+      * and read all-ones.
+      */
+-    if ( unlikely((size > sizeof(long)) || (size & (size - 1))) )
++    if ( unlikely((!do_mmio_split && size > sizeof(long))
++                || (do_mmio_split && size > MAX_INS_EMULATE_MMIO_SIZE)
++                || (size & (size - 1))) )
+     {
+         gdprintk(XENLOG_WARNING, "bad mmio size %d\n", size);
+         ASSERT(p_data != NULL); /* cannot happen with a REP prefix */
+         if ( dir == IOREQ_READ )
+             memset(p_data, ~0, size);
+-        if ( ram_page )
+-            put_page(ram_page);
+-        return X86EMUL_UNHANDLEABLE;
++        goto out_unhandleable;
++    }
++
++    vio = &curr->arch.hvm_vcpu.hvm_io;
++
++    if ( unlikely(do_mmio_split) )
++    {
++        if ( !vio->mmio_split )
++        {
++            /* Beginning of a split MMIO emulation. */
++            if ( vio->io_state != HVMIO_none )
++            {
++                gdprintk(XENLOG_WARNING, "Split MMIO emulation:\n");
++                gdprintk(XENLOG_WARNING, "Invalid IO state when trying to begin a split MMIO emulation.\n");
++                goto out_unhandleable;
++            }
++
++            vio->mmio_split = 1;
++
++            vio->mmio_split_pa = addr;
++            vio->mmio_split_size = sizeof(p->data);
++            vio->mmio_split_done_size = 0;
++            vio->mmio_split_dir = dir;
++
++            /* Load write buffer. */
++            if ( dir == IOREQ_WRITE )
++                memcpy(vio->mmio_split_buf, p_data, vio->io_size);
++        }
+     }
+ 
+     if ( (p_data != NULL) && (dir == IOREQ_WRITE) )
+     {
+-        memcpy(&value, p_data, size);
++        /*
++         * Enter here at:
++         * Beginning of a split MMIO emulation
++         * -> Load value from write buffer for the first round ioreq_t,
++         * End of a split MMIO emulation
++         * -> Do nothing.
++         */
++        if ( unlikely(vio->mmio_split && vio->mmio_split_done_size != vio->io_size) )
++            memcpy(&value, vio->mmio_split_buf + vio->mmio_split_done_size,
++                    vio->mmio_split_size);
++        else
++            memcpy(&value, p_data, size);
++
+         p_data = NULL;
+     }
+ 
+-    vio = &curr->arch.hvm_vcpu.hvm_io;
+-
+     if ( is_mmio && !value_is_ptr )
+     {
+         /* Part of a multi-cycle read or write? */
+@@ -137,7 +175,7 @@ static int hvmemul_do_io(
+         break;
+     case HVMIO_completed:
+         vio->io_state = HVMIO_none;
+-        if ( p_data == NULL )
++        if ( p_data == NULL && !vio->mmio_split )
+         {
+             if ( ram_page )
+                 put_page(ram_page);
+@@ -173,14 +211,30 @@ static int hvmemul_do_io(
+         (p_data == NULL) ? HVMIO_dispatched : HVMIO_awaiting_completion;
+     vio->io_size = size;
+ 
++    if ( !vio->mmio_split )
++    {
++        p->data_is_ptr = value_is_ptr;
++        p->type = is_mmio ? IOREQ_TYPE_COPY : IOREQ_TYPE_PIO;
++        p->size = size;
++        p->addr = addr;
++        p->count = *reps;
++    }
++    else
++    {
++        /*
++         * The first ioreq_t of a split MMIO emulation.
++         */
++        p->data_is_ptr = 0;
++        p->type = IOREQ_TYPE_COPY;
++        p->size = vio->mmio_split_size;
++        p->addr = vio->mmio_split_pa;
++        p->count = 1;
++    }
++
+     p->dir = dir;
+-    p->data_is_ptr = value_is_ptr;
+-    p->type = is_mmio ? IOREQ_TYPE_COPY : IOREQ_TYPE_PIO;
+-    p->size = size;
+-    p->addr = addr;
+-    p->count = *reps;
      p->df = df;
      p->data = value;
 +    p->is_vgt = 0;
  
      if ( dir == IOREQ_WRITE )
          hvmtrace_io_assist(is_mmio, p);
+@@ -209,7 +263,7 @@ static int hvmemul_do_io(
+         rc = X86EMUL_RETRY;
+         if ( !hvm_send_assist_req(curr) )
+             vio->io_state = HVMIO_none;
+-        else if ( p_data == NULL )
++        else if ( p_data == NULL && !vio->mmio_split )
+             rc = X86EMUL_OKAY;
+         break;
+     default:
+@@ -227,8 +281,30 @@ static int hvmemul_do_io(
+     if ( dir == IOREQ_READ )
+         hvmtrace_io_assist(is_mmio, p);
+ 
+-    if ( p_data != NULL )
+-        memcpy(p_data, &vio->io_data, size);
++    if ( unlikely(vio->mmio_split) )
++    {
++        if ( vio->io_size != vio->mmio_split_done_size )
++        {
++            gdprintk(XENLOG_WARNING, "Split MMIO emulation:\n");
++            gdprintk(XENLOG_WARNING, "Finish a uncompleted split MMIO emulation.\n");
++            gdprintk(XENLOG_WARNING, "vio->io_size %d, vio->mmio_split_done_size %d.\n",
++                vio->io_size, vio->mmio_split_done_size);
++
++            vio->mmio_split = 0;
++            goto out_unhandleable;
++        }
++
++        if ( vio->mmio_split_dir == IOREQ_READ )
++            memcpy(p_data, vio->mmio_split_buf, size);
++
++        /* This is the end of a split MMIO emulation. */
++        vio->mmio_split = 0;
++    }
++    else
++    {
++        if ( p_data != NULL )
++            memcpy(p_data, &vio->io_data, size);
++    }
+ 
+     if ( is_mmio && !value_is_ptr )
+     {
+@@ -261,6 +337,11 @@ static int hvmemul_do_io(
+     if ( ram_page )
+         put_page(ram_page);
+     return X86EMUL_OKAY;
++
++out_unhandleable:
++    if ( ram_page )
++        put_page(ram_page);
++    return X86EMUL_UNHANDLEABLE;
+ }
+ 
+ int hvmemul_do_pio(
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 43b6d05..6c79e3d 100644
+index 43b6d05..70edca5 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
 @@ -59,6 +59,7 @@
@@ -894,12 +1064,140 @@ index 43b6d05..6c79e3d 100644
      hvm_destroy_cacheattr_region_list(d);
  }
  
-@@ -1092,6 +1096,14 @@ int hvm_vcpu_initialise(struct vcpu *v)
+@@ -1066,6 +1070,119 @@ static int __init __hvm_register_CPU_XSAVE_save_and_restore(void)
+ }
+ __initcall(__hvm_register_CPU_XSAVE_save_and_restore);
+ 
++static int hvm_mmio_split_check_status(struct vcpu *v)
++{
++    struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
++    ioreq_t *p = get_ioreq(v);
++
++    if ( p->state != STATE_IORESP_READY )
++    {
++        gdprintk(XENLOG_WARNING, "The state of ioreq isn't STATE_IORESP_READY.\n");
++        goto invalid;
++    }
++
++    if ( p->dir != vio->mmio_split_dir )
++    {
++        gdprintk(XENLOG_WARNING, "The direction of ioreq isn't same as mmio_split_dir.\n");
++        goto invalid;
++    }
++
++    if ( p->data_is_ptr
++            || p->type != IOREQ_TYPE_COPY
++            || p->size != vio->mmio_split_size
++            || p->count != 1 )
++    {
++        gdprintk(XENLOG_WARNING, "The configuration of ioreq is invalid.\n");
++        goto invalid;
++    }
++
++    if ( !test_bit(_VPF_blocked_in_xen, &v->pause_flags) )
++    {
++        gdprintk(XENLOG_WARNING, "The state of target VCPU isn't _VPF_blocked_in_xen.\n");
++        goto invalid;
++    }
++
++    return 1;
++
++invalid:
++    return 0;
++}
++
++static void hvm_io_notification_fn(struct vcpu *v, unsigned int port)
++{
++    struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
++    struct hvm_ioreq_page *iorp = &v->domain->arch.hvm_domain.ioreq;
++    ioreq_t *p;
++
++    int mmio_split_finished;
++
++    if ( !vio->mmio_split )
++    {
++        /* Consumer needs notification only if blocked. */
++        if ( test_and_clear_bit(_VPF_blocked_in_xen, &v->pause_flags) )
++            vcpu_wake(v);
++
++        return;
++    }
++
++    spin_lock(&iorp->lock);
++
++    p = get_ioreq(v);
++
++    if ( !hvm_mmio_split_check_status(v) )
++    {
++        gdprintk(XENLOG_WARNING, "The status of split MMIO is invalid.\n");
++        vio->mmio_split = 0;
++
++        goto out_unlock;
++    }
++
++    if ( vio->mmio_split_dir == IOREQ_READ )
++    {
++        memcpy(vio->mmio_split_buf + vio->mmio_split_done_size,
++                &p->data, vio->mmio_split_size);
++
++        vio->mmio_split_done_size += vio->mmio_split_size;
++
++        mmio_split_finished = (vio->mmio_split_done_size == vio->io_size);
++    }
++    else
++    {
++        vio->mmio_split_done_size += vio->mmio_split_size;
++
++        mmio_split_finished = (vio->mmio_split_done_size == vio->io_size);
++
++        if ( !mmio_split_finished )
++            memcpy(&p->data, vio->mmio_split_buf + vio->mmio_split_done_size,
++                    vio->mmio_split_size);
++    }
++
++    if ( !mmio_split_finished )
++    {
++        /* Trigger next round ioreq_t. */
++        p->state = STATE_IOREQ_READY;
++
++        p->addr = vio->mmio_split_pa + vio->mmio_split_done_size;
++
++        spin_unlock(&iorp->lock);
++
++        __notify_via_xen_event_channel(v->domain, port);
++
++        return;
++    }
++    else
++    {
++        /* Consumer needs notification only if blocked. */
++        if ( test_and_clear_bit(_VPF_blocked_in_xen, &v->pause_flags) )
++            vcpu_wake(v);
++    }
++
++out_unlock:
++    spin_unlock(&iorp->lock);
++
++    return;
++}
++
+ int hvm_vcpu_initialise(struct vcpu *v)
+ {
+     int rc;
+@@ -1085,13 +1202,21 @@ int hvm_vcpu_initialise(struct vcpu *v)
+         goto fail3;
+ 
+     /* Create ioreq event channel. */
+-    rc = alloc_unbound_xen_event_channel(v, dm_domid, NULL);
++    rc = alloc_unbound_xen_event_channel(v, dm_domid, hvm_io_notification_fn);
+     if ( rc < 0 )
+         goto fail4;
+ 
      /* Register ioreq event channel. */
      v->arch.hvm_vcpu.xen_port = rc;
  
 +    /* Create ioreq vgt event channel. */
-+    rc = alloc_unbound_xen_event_channel(v, 0, NULL);
++    rc = alloc_unbound_xen_event_channel(v, 0, hvm_io_notification_fn);
 +    if ( rc < 0 )
 +        goto fail4;
 +
@@ -909,7 +1207,7 @@ index 43b6d05..6c79e3d 100644
      if ( v->vcpu_id == 0 )
      {
          /* Create bufioreq event channel. */
-@@ -1103,7 +1115,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
+@@ -1103,7 +1228,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
  
      spin_lock(&d->arch.hvm_domain.ioreq.lock);
      if ( d->arch.hvm_domain.ioreq.va != NULL )
@@ -920,7 +1218,7 @@ index 43b6d05..6c79e3d 100644
      spin_unlock(&d->arch.hvm_domain.ioreq.lock);
  
      spin_lock_init(&v->arch.hvm_vcpu.tm_lock);
-@@ -1197,6 +1212,7 @@ void hvm_vcpu_down(struct vcpu *v)
+@@ -1197,6 +1325,7 @@ void hvm_vcpu_down(struct vcpu *v)
  bool_t hvm_send_assist_req(struct vcpu *v)
  {
      ioreq_t *p;
@@ -928,7 +1226,7 @@ index 43b6d05..6c79e3d 100644
  
      if ( unlikely(!vcpu_start_shutdown_deferral(v)) )
          return 0; /* implicitly bins the i/o operation */
-@@ -1210,14 +1226,16 @@ bool_t hvm_send_assist_req(struct vcpu *v)
+@@ -1210,14 +1339,16 @@ bool_t hvm_send_assist_req(struct vcpu *v)
          return 0;
      }
  
@@ -947,7 +1245,7 @@ index 43b6d05..6c79e3d 100644
  
      return 1;
  }
-@@ -1430,7 +1448,8 @@ int hvm_hap_nested_page_fault(paddr_t gpa,
+@@ -1430,7 +1561,8 @@ int hvm_hap_nested_page_fault(paddr_t gpa,
       * to the mmio handler.
       */
      if ( (p2mt == p2m_mmio_dm) || 
@@ -957,7 +1255,7 @@ index 43b6d05..6c79e3d 100644
      {
          put_gfn(p2m->domain, gfn);
          if ( !handle_mmio() )
-@@ -3796,7 +3815,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -3796,7 +3928,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
                  if ( iorp->va != NULL )
                      /* Initialise evtchn port info if VCPUs already created. */
                      for_each_vcpu ( d, v )
@@ -968,7 +1266,7 @@ index 43b6d05..6c79e3d 100644
                  spin_unlock(&iorp->lock);
                  break;
              case HVM_PARAM_BUFIOREQ_PFN: 
-@@ -3875,9 +3897,17 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -3875,9 +4010,17 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
                      if ( rc )
                          break;
  
@@ -986,7 +1284,7 @@ index 43b6d05..6c79e3d 100644
                      spin_unlock(&iorp->lock);
                  }
                  domain_unpause(d);
-@@ -4375,6 +4405,128 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -4375,6 +4518,84 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
          break;
      }
  
@@ -1013,50 +1311,6 @@ index 43b6d05..6c79e3d 100644
 +        rcu_unlock_domain(d);
 +
 +	break;
-+    }
-+
-+    case HVMOP_vgt_set_trap_io: {
-+        xen_hvm_vgt_set_trap_io_t trap;
-+        struct domain *d;
-+        int i;
-+
-+        /*
-+         * In case there are multiple calls to reset the trap area,
-+         * the latest one will overwright the previous one.
-+         */
-+
-+        if ( copy_from_guest(&trap, arg, 1 ) )
-+            return -EFAULT;
-+
-+        d = rcu_lock_domain_by_any_id(trap.domid);
-+        if ( d == NULL )
-+            return -ESRCH;
-+
-+        if ( !is_hvm_domain(d) ){
-+            rc = -EINVAL;
-+            goto param_fail_vgt_trap_io;
-+        }
-+
-+        rangeset_destroy(d->arch.hvm_domain.vgt_mmio_trap_range);
-+
-+        d->arch.hvm_domain.vgt_mmio_trap_range =
-+            rangeset_new(d, "vGT MMIO Trap Range ", RANGESETF_prettyprint_hex);
-+        ASSERT(d->arch.hvm_domain.vgt_mmio_trap_range);
-+
-+        for (i=0; i<trap.nr_mmio_frags; i++){
-+            rc = rangeset_add_range(d->arch.hvm_domain.vgt_mmio_trap_range,
-+                    trap.mmio_frags[i].s, trap.mmio_frags[i].e);
-+            if (rc)
-+                goto param_fail_vgt_trap_io;
-+        }
-+
-+        rangeset_printk(d->arch.hvm_domain.vgt_mmio_trap_range);
-+        printk("\n");
-+
-+    param_fail_vgt_trap_io:
-+        rcu_unlock_domain(d);
-+
-+        break;
 +    }
 +
 +    case HVMOP_vgt_map_mmio: {
@@ -1151,9 +1405,29 @@ index 85caa0c..578a59d 100644
      if ( type == HVM_PORTIO )
      {
          int rc = dpci_ioport_intercept(p);
+diff --git a/xen/arch/x86/hvm/io.c b/xen/arch/x86/hvm/io.c
+index 4ae2c0c..18106e7 100644
+--- a/xen/arch/x86/hvm/io.c
++++ b/xen/arch/x86/hvm/io.c
+@@ -284,6 +284,15 @@ void hvm_io_assist(void)
+         memcpy(&guest_cpu_user_regs()->eax,
+                &p->data, vio->io_size);
+         break;
++    case HVMIO_dispatched:
++        if ( vio->mmio_split )
++        {
++            /* Emulate and finish split MMIO write. */
++            vio->io_state = HVMIO_completed;
++            vio->io_data = p->data;
++            (void)handle_mmio();
++        }
++        break;
+     default:
+         break;
+     }
 diff --git a/xen/arch/x86/hvm/vgt.c b/xen/arch/x86/hvm/vgt.c
 new file mode 100644
-index 0000000..aa57cbf
+index 0000000..ae24d90
 --- /dev/null
 +++ b/xen/arch/x86/hvm/vgt.c
 @@ -0,0 +1,229 @@
@@ -1201,7 +1475,7 @@ index 0000000..aa57cbf
 +{
 +    return vgt_enabled(v->domain) &&
 +        rangeset_contains_singleton(
-+            v->domain->arch.hvm_domain.vgt_mmio_trap_range , addr);
++            v->domain->iomem_forward_caps, addr);
 +}
 +
 +static int _vgt_mmio_read_write(struct vcpu *v)
@@ -1860,10 +2134,10 @@ index 57dbd0c..76c169b 100644
              mark_regs_dirty(regs);
 diff --git a/xen/arch/x86/vgt.c b/xen/arch/x86/vgt.c
 new file mode 100644
-index 0000000..d1b6bd2
+index 0000000..48d48ca
 --- /dev/null
 +++ b/xen/arch/x86/vgt.c
-@@ -0,0 +1,671 @@
+@@ -0,0 +1,800 @@
 +/*
 + * vgt.c: core logic to handle mediated GT passthrough
 + * Copyright (c) 2011, Intel Corporation.
@@ -2083,9 +2357,8 @@ index 0000000..d1b6bd2
 +    unsigned long hva;
 +    int rc;
 +
-+    rc = iomem_permit_forward ( d, mfn_start, mfn_end );
 +    hva = (unsigned long) mfn_to_virt ( mfn_start );
-+    rc |= map_pages_to_xen ( hva, mfn_start, mfn_end - mfn_start + 1, PAGE_HYPERVISOR_NOCACHE );
++    rc = map_pages_to_xen ( hva, mfn_start, mfn_end - mfn_start + 1, PAGE_HYPERVISOR_NOCACHE );
 +    VGT_LOG ( "Setup MMIO range [0x%lx - 0x%lx](hva 0x%lx) for trap. return %d\n",
 +              mfn_start << PAGE_SHIFT, mfn_end << PAGE_SHIFT, hva, rc );
 +
@@ -2387,6 +2660,13 @@ index 0000000..d1b6bd2
 +    return rc;
 +}
 +
++/* Without this, after Dom0 S3, MMIO read to IGD can always return zero */
++void vgt_resume(void)
++{
++    if (force_wake_state == FORCE_WAKE_STATE_ON)
++        vgt_force_wake_get();
++}
++
 +/*
 + * Take use of hypervisor selector in error code to indicate a
 + * vGT related event.
@@ -2514,11 +2794,6 @@ index 0000000..d1b6bd2
 +
 +    ASSERT ( wp_htable(d) != NULL );
 +
-+    d->arch.hvm_domain.vgt_mmio_trap_range =
-+        rangeset_new(d, "vGT MMIO Trap Range ", RANGESETF_prettyprint_hex);
-+
-+    ASSERT(d->arch.hvm_domain.vgt_mmio_trap_range);
-+
 +    /* FIXME: get the PIO & MMIO base&size */
 +//  register_portio_handler(d, vgt_pio_base, vgt_pio_size, vgt_intercept_io);
 +
@@ -2531,10 +2806,153 @@ index 0000000..d1b6bd2
 +    if (!vgt_enabled(d))
 +        return;
 +
-+    rangeset_destroy(d->arch.hvm_domain.vgt_mmio_trap_range);
++    rangeset_destroy(d->iomem_forward_caps);
 +    free_vgt_wp_hash( wp_htable(d) );
 +    xfree ( wp_htable(d) );
 +}
++
++int vgt_io_trap(struct domain *d, struct xen_domctl_vgt_io_trap *info)
++{
++	struct rangeset *rs;
++
++	void *range;
++
++	int r;
++	int i;
++
++	if (!d)
++		d = dom0;
++
++	/* Process PIO trap range. */
++	rs = d->arch.ioport_forwarding_caps;
++
++	if (info->n_pio) {
++		/* Add range. */
++		for (i = 0; i < info->n_pio; i++) {
++			r = rangeset_add_range(rs, info->pio[i].s, info->pio[i].e);
++			if (r) {
++				printk("VGT(%d): fail to add PIO range [0x%"PRIx64" - 0x%"PRIx64"].\n",
++					d->domain_id, info->pio[i].s, info->pio[i].e);
++				goto err;
++			}
++		}
++
++		printk("DOM %d IO rangeset:\n", d->domain_id);
++
++		rangeset_printk(rs);
++
++		printk("\n");
++	} else {
++		/* Query rangeset. */
++		range = first_range_ex(rs);
++
++		for (i = 0; range && i < MAX_VGT_IO_TRAP_INFO; i++)
++			range = get_range(rs, range, &info->pio[i].s, &info->pio[i].e);
++
++		info->n_pio = i;
++	}
++
++	/* Process MMIO trap range. */
++	rs = d->iomem_forward_caps;
++
++	if (info->n_mmio) {
++		/* Add MMIO range. */
++
++		/* XXX: remove the old trap info. This is necessary since vGT
++		 * doesn't emulate the 4M MMIO BAR of GEN dev correctly now:
++		 * vGT should be improved to use untrap-then-trap logic when
++		 * the BAR is updated.
++		 */
++		rangeset_destroy(d->iomem_forward_caps);
++		d->iomem_forward_caps = rangeset_new(d, "I/O Memory Forwarding",
++                                     RANGESETF_prettyprint_hex);
++		rs = d->iomem_forward_caps;
++
++		for (i = 0; i < info->n_mmio; i++) {
++			printk("VGT(%d): Add MMIO range [0x%"PRIx64" - 0x%"PRIx64"].\n",
++                                        d->domain_id, info->mmio[i].s, info->mmio[i].e);
++
++			if (d == dom0) {
++				if (info->mmio[i].s & ~PAGE_MASK
++					|| info->mmio[i].e & ~PAGE_MASK) {
++					printk("VGT(%d): MMIO range is not page-aligned.\n",
++                                        	d->domain_id);
++
++					r = -EINVAL;
++					goto err;
++				}
++
++				/* DOM0 use MFN. */
++				info->mmio[i].s >>= PAGE_SHIFT;
++				info->mmio[i].e >>= PAGE_SHIFT;
++			}
++
++			r = rangeset_add_range(rs, info->mmio[i].s, info->mmio[i].e);
++			if (r) {
++				printk("VGT(%d): fail to add MMIO range",
++					d->domain_id);
++
++				goto err;
++			}
++
++			if (d == dom0) {
++				/* 
++				 * Map MMIO range into XEN,
++				 * becuase we will access some GFX registers in XEN.
++				 */
++				r = vgt_set_mmio_trap(d, info->mmio[i].s, info->mmio[i].e);
++				if (r) {
++					printk("VGT(%d): fail to map MMIO range.\n",
++						d->domain_id);
++
++					goto err;
++				}
++			}
++		}
++
++		printk("DOM %d MMIO rangeset:\n", d->domain_id);
++
++		rangeset_printk(rs);
++
++		printk("\n");
++
++	} else {
++		/* Query MMIO range. */
++		range = first_range_ex(rs);
++
++		for (i = 0; range && i < MAX_VGT_IO_TRAP_INFO; i++) {
++			range = get_range(rs, range, &info->mmio[i].s, &info->mmio[i].e);
++
++			if (d == dom0) {
++				info->mmio[i].s <<= PAGE_SHIFT;
++				info->mmio[i].e <<= PAGE_SHIFT;
++			}
++		}
++
++		info->n_mmio = i;
++	}
++
++	return 0;
++
++err:
++	info->n_pio = info->n_mmio = 0;
++	return r;
++}
+diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
+index 462d7c7..667e109 100644
+--- a/xen/arch/x86/x86_emulate/x86_emulate.c
++++ b/xen/arch/x86/x86_emulate/x86_emulate.c
+@@ -4198,7 +4198,9 @@ x86_emulate(
+         if ( !rc && (b != 0x6f) && (ea.type == OP_MEM) )
+             rc = ops->write(ea.mem.seg, ea.mem.off, mmvalp,
+                             ea.bytes, ctxt);
+-        goto done;
++        if (rc)
++            goto done;
++        break;
+     }
+ 
+     case 0x80 ... 0x8f: /* jcc (near) */ {
 diff --git a/xen/common/domain.c b/xen/common/domain.c
 index fac3470..317386f 100644
 --- a/xen/common/domain.c
@@ -2552,6 +2970,63 @@ index fac3470..317386f 100644
          goto fail;
  
      if ( domcr_flags & DOMCRF_dummy )
+diff --git a/xen/common/domctl.c b/xen/common/domctl.c
+index 9bd8f80..e056c1b 100644
+--- a/xen/common/domctl.c
++++ b/xen/common/domctl.c
+@@ -298,6 +298,11 @@ long do_domctl(XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
+     case XEN_DOMCTL_test_assign_device:
+         d = NULL;
+         break;
++    case XEN_DOMCTL_vgt_io_trap:
++	if (!op->domain) {
++		d = NULL;
++		break;
++	}
+     default:
+         d = rcu_lock_domain_by_id(op->domain);
+         if ( d == NULL )
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index 64c976b..fdfafd5 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -1140,20 +1140,14 @@ void free_xen_event_channel(
+     (void)__evtchn_close(d, port);
+ }
+ 
+-
+-void notify_via_xen_event_channel(struct domain *ld, int lport)
++void __notify_via_xen_event_channel(struct domain *ld, int lport)
+ {
+     struct evtchn *lchn, *rchn;
+     struct domain *rd;
+     int            rport;
+ 
+-    spin_lock(&ld->event_lock);
+-
+     if ( unlikely(ld->is_dying) )
+-    {
+-        spin_unlock(&ld->event_lock);
+         return;
+-    }
+ 
+     ASSERT(port_is_valid(ld, lport));
+     lchn = evtchn_from_port(ld, lport);
+@@ -1166,6 +1160,14 @@ void notify_via_xen_event_channel(struct domain *ld, int lport)
+         rchn  = evtchn_from_port(rd, rport);
+         evtchn_set_pending(rd->vcpu[rchn->notify_vcpu_id], rport);
+     }
++}
++
++
++void notify_via_xen_event_channel(struct domain *ld, int lport)
++{
++    spin_lock(&ld->event_lock);
++
++    __notify_via_xen_event_channel(ld, lport);
+ 
+     spin_unlock(&ld->event_lock);
+ }
 diff --git a/xen/common/keyhandler.c b/xen/common/keyhandler.c
 index 5072133..26d8dae 100644
 --- a/xen/common/keyhandler.c
@@ -2616,23 +3091,10 @@ index d79464d..c1fd46b 100644
      uint8_t cmos_idx;
  
 diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
-index 27b3de5..da2e2b5 100644
+index 27b3de5..6101397 100644
 --- a/xen/include/asm-x86/hvm/domain.h
 +++ b/xen/include/asm-x86/hvm/domain.h
-@@ -35,12 +35,37 @@
- #include <public/hvm/params.h>
- #include <public/hvm/save.h>
- 
-+struct vgt_trap_io {
-+//    uint16_t  nr_pio_frags;
-+//    struct trap_frags   pio_frags[2];
-+    uint16_t  nr_mmio_frags;
-+    struct trap_frags   mmio_frags[4];
-+};
-+
- struct hvm_ioreq_page {
-     spinlock_t lock;
-     struct page_info *page;
+@@ -41,6 +41,24 @@ struct hvm_ioreq_page {
      void *va;
  };
  
@@ -2657,12 +3119,11 @@ index 27b3de5..da2e2b5 100644
  struct hvm_domain {
      struct hvm_ioreq_page  ioreq;
      struct hvm_ioreq_page  buf_ioreq;
-@@ -100,9 +125,14 @@ struct hvm_domain {
+@@ -100,9 +118,13 @@ struct hvm_domain {
          struct vmx_domain vmx;
          struct svm_domain svm;
      };
 +    bool_t                  vgt_enabled;
-+    struct rangeset *vgt_mmio_trap_range;
 +    struct wp_hash_table   *vgt_wp_hash_base;
 +    spinlock_t             vgt_wp_hash_lock;
  };
@@ -2705,10 +3166,34 @@ index 410a5f6..a237c71 100644
  int hvm_io_intercept(ioreq_t *p, int type);
  void register_io_handler(
 diff --git a/xen/include/asm-x86/hvm/vcpu.h b/xen/include/asm-x86/hvm/vcpu.h
-index e8b8cd7..cb091b0 100644
+index e8b8cd7..871998a 100644
 --- a/xen/include/asm-x86/hvm/vcpu.h
 +++ b/xen/include/asm-x86/hvm/vcpu.h
-@@ -170,6 +170,7 @@ struct hvm_vcpu {
+@@ -44,12 +44,23 @@ struct hvm_vcpu_asid {
+     uint32_t asid;
+ };
+ 
++/* Max MMIO read or write size in one instruction emulation */
++#define MAX_INS_EMULATE_MMIO_SIZE   32
++
+ struct hvm_vcpu_io {
+     /* I/O request in flight to device model. */
+     enum hvm_io_state   io_state;
+     unsigned long       io_data;
+     int                 io_size;
+ 
++    int                 mmio_split;
++    int                 mmio_split_size;
++    int                 mmio_split_dir;
++
++    paddr_t             mmio_split_pa;
++    unsigned int        mmio_split_done_size;
++    uint8_t             mmio_split_buf[MAX_INS_EMULATE_MMIO_SIZE];
++
+     /*
+      * HVM emulation:
+      *  Virtual address @mmio_gva maps to MMIO physical frame @mmio_gpfn.
+@@ -170,6 +181,7 @@ struct hvm_vcpu {
      struct hvm_trap     inject_trap;
  
      struct viridian_vcpu viridian;
@@ -2810,10 +3295,10 @@ index 82cbcee..5420920 100644
   *
 diff --git a/xen/include/asm-x86/vgt.h b/xen/include/asm-x86/vgt.h
 new file mode 100644
-index 0000000..56d09c4
+index 0000000..2e0afa8
 --- /dev/null
 +++ b/xen/include/asm-x86/vgt.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,43 @@
 +/*
 + * vgt.h: vGT related definitions
 + * Copyright (c) 2011, Intel Corporation.
@@ -2835,6 +3320,7 @@ index 0000000..56d09c4
 +#ifndef __ASM_X86_VGT_H__
 +#define __ASM_X86_VGT_H__
 +
++extern int vgt_io_trap(struct domain *d, struct xen_domctl_vgt_io_trap *info);
 +extern int set_vgt_info(unsigned int gen_dev_bdf, unsigned int gen_dev_type);
 +extern int vgt_hvm_init(struct domain *d);
 +extern void vgt_hvm_deinit(struct domain *d);
@@ -2850,6 +3336,9 @@ index 0000000..56d09c4
 +
 +#define CF8_to_BDF(cf8)    (((unsigned int)(cf8) >> 8) & 0xffff)
 +extern unsigned int vgt_bdf;
++
++void vgt_resume(void);
++
 +#endif // __ASM_X86_VGT_H__
 +
 +
@@ -2894,6 +3383,55 @@ index c193c88..5ee47fd 100644
  #define PAGE_HYPERVISOR         (__PAGE_HYPERVISOR         | _PAGE_GLOBAL)
  #define PAGE_HYPERVISOR_NOCACHE (__PAGE_HYPERVISOR_NOCACHE | _PAGE_GLOBAL)
  
+diff --git a/xen/include/public/domctl.h b/xen/include/public/domctl.h
+index 4c5b2bb..869f381 100644
+--- a/xen/include/public/domctl.h
++++ b/xen/include/public/domctl.h
+@@ -537,6 +537,24 @@ struct xen_domctl_ioport_mapping {
+ typedef struct xen_domctl_ioport_mapping xen_domctl_ioport_mapping_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_domctl_ioport_mapping_t);
+ 
++#define MAX_VGT_IO_TRAP_INFO 4
++
++struct vgt_io_trap_info {
++	uint64_t s;
++	uint64_t e;
++};
++
++struct xen_domctl_vgt_io_trap {
++	uint32_t n_pio;
++	struct vgt_io_trap_info pio[MAX_VGT_IO_TRAP_INFO];
++
++	uint32_t n_mmio;
++	struct vgt_io_trap_info mmio[MAX_VGT_IO_TRAP_INFO];
++};
++
++typedef struct xen_domctl_vgt_io_trap xen_domctl_vgt_io_trap_t;
++DEFINE_XEN_GUEST_HANDLE(xen_domctl_vgt_io_trap_t);
++
+ 
+ /*
+  * Pin caching type of RAM space for x86 HVM domU.
+@@ -924,6 +942,9 @@ struct xen_domctl {
+ #define XEN_DOMCTL_gdbsx_pausevcpu             1001
+ #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
+ #define XEN_DOMCTL_gdbsx_domstatus             1003
++
++#define XEN_DOMCTL_vgt_io_trap               	700
++
+     uint32_t interface_version; /* XEN_DOMCTL_INTERFACE_VERSION */
+     domid_t  domain;
+     union {
+@@ -979,7 +1000,8 @@ struct xen_domctl {
+         struct xen_domctl_set_broken_page_p2m set_broken_page_p2m;
+         struct xen_domctl_gdbsx_pauseunp_vcpu gdbsx_pauseunp_vcpu;
+         struct xen_domctl_gdbsx_domstatus   gdbsx_domstatus;
+-        uint8_t                             pad[128];
++	struct xen_domctl_vgt_io_trap	    vgt_io_trap;
++        uint8_t                             pad[256];
+     } u;
+ };
+ typedef struct xen_domctl xen_domctl_t;
 diff --git a/xen/include/public/hvm/e820.h b/xen/include/public/hvm/e820.h
 index 5bdc227..683f091 100644
 --- a/xen/include/public/hvm/e820.h
@@ -2908,24 +3446,13 @@ index 5bdc227..683f091 100644
  #define HVM_BELOW_4G_MMIO_LENGTH    ((1ULL << 32) - HVM_BELOW_4G_MMIO_START)
  
 diff --git a/xen/include/public/hvm/hvm_op.h b/xen/include/public/hvm/hvm_op.h
-index a9aab4b..df23807 100644
+index a9aab4b..4bfdd85 100644
 --- a/xen/include/public/hvm/hvm_op.h
 +++ b/xen/include/public/hvm/hvm_op.h
-@@ -270,6 +270,47 @@ struct xen_hvm_inject_msi {
+@@ -270,6 +270,36 @@ struct xen_hvm_inject_msi {
  typedef struct xen_hvm_inject_msi xen_hvm_inject_msi_t;
  DEFINE_XEN_GUEST_HANDLE(xen_hvm_inject_msi_t);
  
-+#define HVMOP_vgt_set_trap_io       17
-+struct xen_hvm_vgt_set_trap_io {
-+    domid_t  domid;
-+    uint16_t nr_pio_frags;
-+    struct trap_frags	pio_frags[MAX_TRAP_FRAGS];
-+    uint16_t nr_mmio_frags;
-+    struct trap_frags	mmio_frags[MAX_TRAP_FRAGS];
-+};
-+typedef struct xen_hvm_vgt_set_trap_io xen_hvm_vgt_set_trap_io_t;
-+DEFINE_XEN_GUEST_HANDLE(xen_hvm_vgt_set_trap_io_t);
-+
 +#define HVMOP_vgt_map_mmio           18
 +struct xen_hvm_vgt_map_mmio {
 +	uint16_t  domid;
@@ -3042,10 +3569,10 @@ index 4341f54..7688c8b 100644
      } u;
  };
 diff --git a/xen/include/public/vcpu.h b/xen/include/public/vcpu.h
-index e888daf..fa493d8 100644
+index e888daf..5fa5066 100644
 --- a/xen/include/public/vcpu.h
 +++ b/xen/include/public/vcpu.h
-@@ -227,6 +227,66 @@ struct vcpu_register_time_memory_area {
+@@ -227,6 +227,57 @@ struct vcpu_register_time_memory_area {
  typedef struct vcpu_register_time_memory_area vcpu_register_time_memory_area_t;
  DEFINE_XEN_GUEST_HANDLE(vcpu_register_time_memory_area_t);
  
@@ -3080,15 +3607,6 @@ index e888daf..fa493d8 100644
 +typedef struct vcpu_emul_ioreq vcpu_emul_ioreq_t;
 +DEFINE_XEN_GUEST_HANDLE(vcpu_emul_ioreq_t);
 +
-+/* Activate I/O self-forwarding for the specified VCPU */
-+#define VCPUOP_start_io_forward           15
-+struct vcpu_io_forwarding_request {
-+    int16_t      nr_pio_frags;
-+    struct trap_frags	  pio_frags[MAX_TRAP_FRAGS];
-+    int16_t      nr_mmio_frags;  /* 0..max-1, -1 means let VMM fill */
-+    struct trap_frags	  mmio_frags[MAX_TRAP_FRAGS];	/*s/e address */
-+};
-+
 +#define VCPUOP_get_sysdata           16
 +/* sub operations */
 +#define VCPUOP_sysdata_get_segment   0
@@ -3113,23 +3631,31 @@ index e888daf..fa493d8 100644
  
  /*
 diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
-index 3cab74f..a342657 100644
+index 3cab74f..8ac4740 100644
 --- a/xen/include/public/xen.h
 +++ b/xen/include/public/xen.h
-@@ -789,6 +789,13 @@ struct xen_multiboot_mod_list
+@@ -789,6 +789,7 @@ struct xen_multiboot_mod_list
      /* Unused, must be zero */
      uint32_t pad;
  };
 +
-+struct trap_frags {
-+    uint64_t   s;   /* start address */
-+    uint64_t   e;   /* end address */
-+};
-+#define MAX_TRAP_FRAGS	32
-+
  /*
   * `incontents 200 startofday_dom0_console Dom0_console
   *
+diff --git a/xen/include/xen/event.h b/xen/include/xen/event.h
+index 4ac39ad..3d80a9d 100644
+--- a/xen/include/xen/event.h
++++ b/xen/include/xen/event.h
+@@ -66,6 +66,9 @@ void free_xen_event_channel(
+ /* Query if event channel is in use by the guest */
+ int guest_enabled_event(struct vcpu *v, uint32_t virq);
+ 
++/* Notify remote end of a Xen-attached event channel - no event lock held. */
++void __notify_via_xen_event_channel(struct domain *ld, int lport);
++
+ /* Notify remote end of a Xen-attached event channel.*/
+ void notify_via_xen_event_channel(struct domain *ld, int lport);
+ 
 diff --git a/xen/include/xen/iocap.h b/xen/include/xen/iocap.h
 index b755ecb..16a88be 100644
 --- a/xen/include/xen/iocap.h
