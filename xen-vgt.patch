@@ -71,27 +71,18 @@ index 6641197..09ab9a9 100644
  
  extern unsigned long pci_mem_start, pci_mem_end;
 diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
-index 627e8cb..4c1ae07 100644
+index 627e8cb..767a35c 100644
 --- a/tools/firmware/hvmloader/pci.c
 +++ b/tools/firmware/hvmloader/pci.c
 @@ -24,6 +24,7 @@
  #include "hypercall.h"
  #include "config.h"
  #include "pci_regs.h"
-+#include "vgt_devtable.h"
++#include "vgt.h"
  
  #include <xen/memory.h>
  #include <xen/hvm/ioreq.h>
-@@ -36,6 +37,8 @@ unsigned long pci_mem_end = PCI_MEM_END;
- enum virtual_vga virtual_vga = VGA_none;
- unsigned long igd_opregion_pgbase = 0;
- 
-+static int is_vgt = 0;
-+
- void pci_setup(void)
- {
-     uint8_t is_64bar, using_64bar, bar64_relocate = 0;
-@@ -111,30 +114,55 @@ void pci_setup(void)
+@@ -111,35 +112,31 @@ void pci_setup(void)
          ASSERT((devfn != PCI_ISA_DEVFN) ||
                 ((vendor_id == 0x8086) && (device_id == 0x7000)));
  
@@ -112,46 +103,30 @@ index 627e8cb..4c1ae07 100644
                  vga_devfn = devfn;
                  virtual_vga = VGA_cirrus;
              }
-             else if ( virtual_vga == VGA_none )
-             {
--                vga_devfn = devfn;
--                virtual_vga = VGA_pt;
-+                printf("No emulated vga\n");
-+                if ( (vendor_id == 0x8086) && 
+-            else if ( virtual_vga == VGA_none )
++            else if ( (vendor_id == 0x8086) && 
 +                      (_is_sandybridge(device_id) || _is_ivybridge(device_id)
 +                       || _is_haswell(device_id) )
 +                    )
-+                {
-+                   /*
-+                    * Found VGT device, and use standard VGA bios.
-+                    * (may be overwritten by CirrusLogic)
-+                    * TODO: Revisit to co-exist with VTd GEN HW.
-+                    */
-+                    printf("Found VGT\n");
-+                    vga_devfn = devfn;
-+                    virtual_vga = VGA_std;
-+
-+                    is_vgt = 1;
-+                }
-+                else
-+                {
-+                    printf("Found VTD\n");
-+                    vga_devfn = devfn;
-+                    virtual_vga = VGA_pt;
-+                }
-+
-                 if ( vendor_id == 0x8086 )
-                 {
+             {
++                printf("Detect Intel Graphics Device\n");
+                 vga_devfn = devfn;
+                 virtual_vga = VGA_pt;
+-                if ( vendor_id == 0x8086 )
+-                {
 -                    igd_opregion_pgbase = mem_hole_alloc(IGD_OPREGION_PAGES);
-+                    igd_opregion_pgbase = mem_hole_alloc(2);
-                     /*
-                      * Write the the OpRegion offset to give the opregion
+-                    /*
+-                     * Write the the OpRegion offset to give the opregion
 -                     * address to the device model. The device model will trap 
-+                     * address to the device model. The device model will trap
-                      * and map the OpRegion at the give address.
-                      */
-                     pci_writel(vga_devfn, PCI_INTEL_OPREGION,
-@@ -272,6 +300,13 @@ void pci_setup(void)
+-                     * and map the OpRegion at the give address.
+-                     */
+-                    pci_writel(vga_devfn, PCI_INTEL_OPREGION,
+-                               igd_opregion_pgbase << PAGE_SHIFT);
+-                }
+             }
+             break;
+         case 0x0680:
+@@ -272,6 +269,13 @@ void pci_setup(void)
              unsigned int,
              hvm_info->low_mem_pgend - (pci_mem_start >> PAGE_SHIFT),
              (1u << 16) - 1);
@@ -165,25 +140,56 @@ index 627e8cb..4c1ae07 100644
          if ( hvm_info->high_mem_pgend == 0 )
              hvm_info->high_mem_pgend = 1ull << (32 - PAGE_SHIFT);
          hvm_info->low_mem_pgend -= nr_pages;
-@@ -308,6 +343,16 @@ void pci_setup(void)
-     io_resource.base = 0xc000;
-     io_resource.max = 0x10000;
+@@ -400,6 +404,47 @@ void pci_setup(void)
  
-+
-+    /* XXX: we use this hack to tell vGT driver the top of <4G mem, so vGT
-+     * can avoid unnecessary attempts to map the mem hole. This optimization
-+     * can speed up guest bootup time and improve Win7 SMP guest's stability.
-+     * NOTE: here we're actually trying to write 32 bits into VENDOR_ID and
-+     * DEVICE_ID -- we assume normally sane codes in guest won't do this...
-+     */
-+    if ( is_vgt )
-+        pci_writel(vga_devfn, PCI_VENDOR_ID, hvm_info->low_mem_pgend);
-+
-     /* Assign iomem and ioport resources in descending order of size. */
-     for ( i = 0; i < nr_bars; i++ )
+     if ( vga_devfn != 256 )
      {
++        if (virtual_vga == VGA_pt) {
++            uint32_t bar = pci_readl(vga_devfn, PCI_BASE_ADDRESS_0)
++                & PCI_BASE_ADDRESS_MEM_MASK;
++
++            void *pvinfo = (void *)bar + VGT_PVINFO_PAGE;
++            uint64_t *magic = pvinfo;
++
++            if (*magic == VGT_MAGIC) {
++                /*
++                 * Found VGT device, and use standard VGA bios.
++                 */
++                printf("Found VGT\n");
++                virtual_vga = VGA_std;
++
++                /* XXX: we use this hack to tell vGT driver the
++                 * top of <4G mem, so vGT can avoid unnecessary
++                 * attempts to map the mem hole. This optimization
++                 * can speed up guest bootup time and improve Win7
++                 * SMP guest's stability.
++                 * NOTE: here we're actually trying to write 32 bits
++                 * into VENDOR_ID and DEVICE_ID -- we assume normally
++                 * sane codes in guest won't do this...
++                 */
++                pci_writel(vga_devfn, PCI_VENDOR_ID, hvm_info->low_mem_pgend);
++            } else {
++                /*
++                 * Found VTD device, and use physical VGA bios.
++                 */
++                printf("Found VTD\n");
++            }
++
++            igd_opregion_pgbase = mem_hole_alloc(2);
++            /*
++             * Write the the OpRegion offset to give the opregion
++             * address to the device model. The device model will trap
++             * and map the OpRegion at the give address.
++             */
++            pci_writel(vga_devfn, PCI_INTEL_OPREGION,
++                    igd_opregion_pgbase << PAGE_SHIFT);
++        }
++
+         /*
+          * VGA registers live in I/O space so ensure that primary VGA
+          * has IO enabled, even if there is no I/O BAR on that
 diff --git a/tools/firmware/hvmloader/seabios.c b/tools/firmware/hvmloader/seabios.c
-index f17e67b..98fb9af 100644
+index dd7dfbe..6938ef8 100644
 --- a/tools/firmware/hvmloader/seabios.c
 +++ b/tools/firmware/hvmloader/seabios.c
 @@ -29,6 +29,7 @@
@@ -194,10 +200,12 @@ index f17e67b..98fb9af 100644
  #include "roms.inc"
  
  extern unsigned char dsdt_anycpu_qemu_xen[];
-@@ -135,6 +136,18 @@ static void seabios_setup_e820(void)
+@@ -133,6 +134,20 @@ static void seabios_setup_e820(void)
+     dump_e820_table(e820, info->e820_nr);
+ }
  
- //BUILD_BUG_ON(sizeof(seabios) > (0x00100000U - SEABIOS_PHYSICAL_ADDRESS));
- 
++//BUILD_BUG_ON(sizeof(seabios) > (0x00100000U - SEABIOS_PHYSICAL_ADDRESS));
++
 +#ifdef SEABIOS_INCLUDE_VGABIOS
 +static void seabios_load_roms(void)
 +{
@@ -213,9 +221,9 @@ index f17e67b..98fb9af 100644
  struct bios_config seabios_config = {
      .name = "SeaBIOS",
  
-@@ -143,7 +156,11 @@ struct bios_config seabios_config = {
+@@ -141,7 +156,11 @@ struct bios_config seabios_config = {
  
-     .bios_address = SEABIOS_PHYSICAL_ADDRESS,
+     .bios_address = 0x100000 - sizeof(seabios),
  
 +#ifdef SEABIOS_INCLUDE_VGABIOS
 +    .load_roms = seabios_load_roms,
@@ -225,12 +233,12 @@ index f17e67b..98fb9af 100644
  
      .bios_load = NULL,
  
-diff --git a/tools/firmware/hvmloader/vgt_devtable.h b/tools/firmware/hvmloader/vgt_devtable.h
+diff --git a/tools/firmware/hvmloader/vgt.h b/tools/firmware/hvmloader/vgt.h
 new file mode 100644
-index 0000000..222ee64
+index 0000000..afec057
 --- /dev/null
-+++ b/tools/firmware/hvmloader/vgt_devtable.h
-@@ -0,0 +1,113 @@
++++ b/tools/firmware/hvmloader/vgt.h
+@@ -0,0 +1,118 @@
 +/*
 + * Copyright (c) 2012-2013, Intel Corporation.
 + *
@@ -250,6 +258,11 @@ index 0000000..222ee64
 +
 +#ifndef _VGT_DEVTABLE_H
 +#define _VGT_DEVTABLE_H
++
++#define VGT_PVINFO_PAGE 	0x78000
++#define VGT_MAGIC		0x4776544776544776    /* 'vGTvGTvG' */
++#define VGT_VERSION_MAJOR	1
++#define VGT_VERSION_MINOR	0
 +
 +static inline int _is_sandybridge(int devid)
 +{
@@ -410,10 +423,10 @@ index 0000000..d917519
 +         init_optionrom((void*)BUILD_ROM_START, 0, 1);
 +     } else {
 diff --git a/tools/libxl/libxl.c b/tools/libxl/libxl.c
-index 3236aa9..4322fbd 100644
+index 826236f..0530303 100644
 --- a/tools/libxl/libxl.c
 +++ b/tools/libxl/libxl.c
-@@ -1284,6 +1284,29 @@ static void domain_destroy_callback(libxl__egc *egc,
+@@ -1285,6 +1285,29 @@ static void domain_destroy_callback(libxl__egc *egc,
  static void destroy_finish_check(libxl__egc *egc,
                                   libxl__domain_destroy_state *dds);
  
@@ -443,7 +456,7 @@ index 3236aa9..4322fbd 100644
  void libxl__domain_destroy(libxl__egc *egc, libxl__domain_destroy_state *dds)
  {
      STATE_AO_GC(dds->ao);
-@@ -1466,6 +1489,8 @@ static void devices_destroy_cb(libxl__egc *egc,
+@@ -1467,6 +1490,8 @@ static void devices_destroy_cb(libxl__egc *egc,
  
      libxl__userdata_destroyall(gc, domid);
  
@@ -466,7 +479,7 @@ index 0c32d0b..bf29699 100644
  
          break;
 diff --git a/tools/libxl/libxl_dm.c b/tools/libxl/libxl_dm.c
-index 7e54c02..684a086 100644
+index 7e54c02..512d50e 100644
 --- a/tools/libxl/libxl_dm.c
 +++ b/tools/libxl/libxl_dm.c
 @@ -185,12 +185,32 @@ static char ** libxl__build_device_model_args_old(libxl__gc *gc,
@@ -561,16 +574,6 @@ index 7e54c02..684a086 100644
  
          if (b_info->u.hvm.boot) {
              flexarray_vappend(dm_args, "-boot",
-@@ -553,9 +594,6 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
-             flexarray_append(dm_args, "-net");
-             flexarray_append(dm_args, "none");
-         }
--        if (libxl_defbool_val(b_info->u.hvm.gfx_passthru)) {
--            flexarray_append(dm_args, "-gfx_passthru");
--        }
-     } else {
-         if (!sdl && !vnc) {
-             flexarray_append(dm_args, "-nographic");
 diff --git a/tools/libxl/libxl_pci.c b/tools/libxl/libxl_pci.c
 index 88bf91e..5eb6196 100644
 --- a/tools/libxl/libxl_pci.c
@@ -620,7 +623,7 @@ index d218a2d..11a7a59 100644
                                         
                                         ("serial",           string),
 diff --git a/tools/libxl/xl_cmdimpl.c b/tools/libxl/xl_cmdimpl.c
-index 8a478ba..f428160 100644
+index f5943a4..c208d23 100644
 --- a/tools/libxl/xl_cmdimpl.c
 +++ b/tools/libxl/xl_cmdimpl.c
 @@ -1464,6 +1464,17 @@ skip_vfb:
@@ -701,7 +704,7 @@ index f41f0de..d36b93f 100644
  
  static void freeze_domains(void)
 diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
-index 52c9040..22a5d06 100644
+index 146fb9f..5b6f8fb 100644
 --- a/xen/arch/x86/domain.c
 +++ b/xen/arch/x86/domain.c
 @@ -60,6 +60,7 @@
@@ -730,7 +733,7 @@ index 52c9040..22a5d06 100644
          rc = -ENOMEM;
          if ( d->arch.ioport_caps == NULL )
              goto fail;
-@@ -1020,6 +1025,48 @@ arch_do_vcpu_op(
+@@ -1012,6 +1017,48 @@ arch_do_vcpu_op(
          break;
      }
  
@@ -780,7 +783,7 @@ index 52c9040..22a5d06 100644
          rc = -ENOSYS;
          break;
 diff --git a/xen/arch/x86/domain_build.c b/xen/arch/x86/domain_build.c
-index 03fe845..2e83ea2 100644
+index 8365f32..ef91981 100644
 --- a/xen/arch/x86/domain_build.c
 +++ b/xen/arch/x86/domain_build.c
 @@ -35,6 +35,7 @@
@@ -792,7 +795,7 @@ index 03fe845..2e83ea2 100644
  #include <public/version.h>
  
 diff --git a/xen/arch/x86/domctl.c b/xen/arch/x86/domctl.c
-index c2a04c4..016a103 100644
+index e75918a..f0bd9ee 100644
 --- a/xen/arch/x86/domctl.c
 +++ b/xen/arch/x86/domctl.c
 @@ -35,6 +35,7 @@
@@ -813,7 +816,7 @@ index c2a04c4..016a103 100644
          {
              printk(XENLOG_G_INFO
                     "memory_map:add: dom%d gfn=%lx mfn=%lx nr=%lx\n",
-@@ -1214,6 +1216,19 @@ long arch_do_domctl(
+@@ -1223,6 +1225,19 @@ long arch_do_domctl(
      }
      break;
  
@@ -846,7 +849,7 @@ index eea5555..765a09f 100644
 +obj-y += vpmu.o
 +obj-y += vgt.o
 diff --git a/xen/arch/x86/hvm/emulate.c b/xen/arch/x86/hvm/emulate.c
-index 9bfba48..9ea1191 100644
+index b206997..44877fa 100644
 --- a/xen/arch/x86/hvm/emulate.c
 +++ b/xen/arch/x86/hvm/emulate.c
 @@ -61,6 +61,7 @@ static int hvmemul_do_io(
@@ -1027,7 +1030,7 @@ index 9bfba48..9ea1191 100644
  
  int hvmemul_do_pio(
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 43b6d05..70edca5 100644
+index 4cf503b..0d0c97c 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
 @@ -59,6 +59,7 @@
@@ -1064,7 +1067,7 @@ index 43b6d05..70edca5 100644
      hvm_destroy_cacheattr_region_list(d);
  }
  
-@@ -1066,6 +1070,119 @@ static int __init __hvm_register_CPU_XSAVE_save_and_restore(void)
+@@ -1094,6 +1098,119 @@ static int __init __hvm_register_CPU_XSAVE_save_and_restore(void)
  }
  __initcall(__hvm_register_CPU_XSAVE_save_and_restore);
  
@@ -1184,7 +1187,7 @@ index 43b6d05..70edca5 100644
  int hvm_vcpu_initialise(struct vcpu *v)
  {
      int rc;
-@@ -1085,13 +1202,21 @@ int hvm_vcpu_initialise(struct vcpu *v)
+@@ -1113,13 +1230,21 @@ int hvm_vcpu_initialise(struct vcpu *v)
          goto fail3;
  
      /* Create ioreq event channel. */
@@ -1207,7 +1210,7 @@ index 43b6d05..70edca5 100644
      if ( v->vcpu_id == 0 )
      {
          /* Create bufioreq event channel. */
-@@ -1103,7 +1228,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
+@@ -1131,7 +1256,10 @@ int hvm_vcpu_initialise(struct vcpu *v)
  
      spin_lock(&d->arch.hvm_domain.ioreq.lock);
      if ( d->arch.hvm_domain.ioreq.va != NULL )
@@ -1218,7 +1221,7 @@ index 43b6d05..70edca5 100644
      spin_unlock(&d->arch.hvm_domain.ioreq.lock);
  
      spin_lock_init(&v->arch.hvm_vcpu.tm_lock);
-@@ -1197,6 +1325,7 @@ void hvm_vcpu_down(struct vcpu *v)
+@@ -1225,6 +1353,7 @@ void hvm_vcpu_down(struct vcpu *v)
  bool_t hvm_send_assist_req(struct vcpu *v)
  {
      ioreq_t *p;
@@ -1226,7 +1229,7 @@ index 43b6d05..70edca5 100644
  
      if ( unlikely(!vcpu_start_shutdown_deferral(v)) )
          return 0; /* implicitly bins the i/o operation */
-@@ -1210,14 +1339,16 @@ bool_t hvm_send_assist_req(struct vcpu *v)
+@@ -1238,14 +1367,16 @@ bool_t hvm_send_assist_req(struct vcpu *v)
          return 0;
      }
  
@@ -1245,7 +1248,7 @@ index 43b6d05..70edca5 100644
  
      return 1;
  }
-@@ -1430,7 +1561,8 @@ int hvm_hap_nested_page_fault(paddr_t gpa,
+@@ -1458,7 +1589,8 @@ int hvm_hap_nested_page_fault(paddr_t gpa,
       * to the mmio handler.
       */
      if ( (p2mt == p2m_mmio_dm) || 
@@ -1255,7 +1258,7 @@ index 43b6d05..70edca5 100644
      {
          put_gfn(p2m->domain, gfn);
          if ( !handle_mmio() )
-@@ -3796,7 +3928,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -3819,7 +3951,10 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
                  if ( iorp->va != NULL )
                      /* Initialise evtchn port info if VCPUs already created. */
                      for_each_vcpu ( d, v )
@@ -1266,7 +1269,7 @@ index 43b6d05..70edca5 100644
                  spin_unlock(&iorp->lock);
                  break;
              case HVM_PARAM_BUFIOREQ_PFN: 
-@@ -3875,9 +4010,17 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -3898,9 +4033,17 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
                      if ( rc )
                          break;
  
@@ -1284,7 +1287,7 @@ index 43b6d05..70edca5 100644
                      spin_unlock(&iorp->lock);
                  }
                  domain_unpause(d);
-@@ -4375,6 +4518,84 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
+@@ -4398,6 +4541,84 @@ long do_hvm_op(unsigned long op, XEN_GUEST_HANDLE_PARAM(void) arg)
          break;
      }
  
@@ -1370,7 +1373,7 @@ index 43b6d05..70edca5 100644
          xen_hvm_xentrace_t tr;
  
 diff --git a/xen/arch/x86/hvm/intercept.c b/xen/arch/x86/hvm/intercept.c
-index 85caa0c..578a59d 100644
+index 5bb1c17..d13cae4 100644
 --- a/xen/arch/x86/hvm/intercept.c
 +++ b/xen/arch/x86/hvm/intercept.c
 @@ -22,6 +22,7 @@
@@ -1392,7 +1395,7 @@ index 85caa0c..578a59d 100644
  };
  
  static int hvm_mmio_access(struct vcpu *v,
-@@ -193,6 +196,12 @@ int hvm_io_intercept(ioreq_t *p, int type)
+@@ -224,6 +227,12 @@ int hvm_io_intercept(ioreq_t *p, int type)
      int i;
      unsigned long addr, size;
  
@@ -1406,7 +1409,7 @@ index 85caa0c..578a59d 100644
      {
          int rc = dpci_ioport_intercept(p);
 diff --git a/xen/arch/x86/hvm/io.c b/xen/arch/x86/hvm/io.c
-index 4ae2c0c..18106e7 100644
+index 5f5009a..6d6d434 100644
 --- a/xen/arch/x86/hvm/io.c
 +++ b/xen/arch/x86/hvm/io.c
 @@ -284,6 +284,15 @@ void hvm_io_assist(void)
@@ -1661,7 +1664,7 @@ index 0000000..ae24d90
 +    return ret;
 +}
 diff --git a/xen/arch/x86/hvm/vmsi.c b/xen/arch/x86/hvm/vmsi.c
-index 36de312..a2563a4 100644
+index e8aa61c..5225037 100644
 --- a/xen/arch/x86/hvm/vmsi.c
 +++ b/xen/arch/x86/hvm/vmsi.c
 @@ -34,6 +34,7 @@
@@ -1672,11 +1675,42 @@ index 36de312..a2563a4 100644
  #include <asm/hvm/io.h>
  #include <asm/hvm/vpic.h>
  #include <asm/hvm/vlapic.h>
+diff --git a/xen/arch/x86/hvm/vmx/vmcs.c b/xen/arch/x86/hvm/vmx/vmcs.c
+index 2ed25c7..eec13cf 100644
+--- a/xen/arch/x86/hvm/vmx/vmcs.c
++++ b/xen/arch/x86/hvm/vmx/vmcs.c
+@@ -1273,7 +1273,8 @@ void vmx_do_resume(struct vcpu *v)
+          *  2: execute wbinvd on all dirty pCPUs when guest wbinvd exits.
+          * If VT-d engine can force snooping, we don't need to do these.
+          */
+-        if ( has_arch_pdevs(v->domain) && !iommu_snoop
++        if ( ((has_arch_pdevs(v->domain) && !iommu_snoop) ||
++                    vgt_enabled(v->domain))
+                 && !cpu_has_wbinvd_exiting )
+         {
+             int cpu = v->arch.hvm_vmx.active_cpu;
+diff --git a/xen/arch/x86/hvm/vmx/vmx.c b/xen/arch/x86/hvm/vmx/vmx.c
+index 0e5d3b4..6412e8c 100644
+--- a/xen/arch/x86/hvm/vmx/vmx.c
++++ b/xen/arch/x86/hvm/vmx/vmx.c
+@@ -2140,10 +2140,8 @@ static void wbinvd_ipi(void *info)
+ 
+ static void vmx_wbinvd_intercept(void)
+ {
+-    if ( !has_arch_mmios(current->domain) )
+-        return;
+-
+-    if ( iommu_snoop )
++    if ( (!has_arch_mmios(current->domain) || iommu_snoop) &&
++        !vgt_enabled(current->domain) )
+         return;
+ 
+     if ( cpu_has_wbinvd_exiting )
 diff --git a/xen/arch/x86/mm.c b/xen/arch/x86/mm.c
-index 77dcafc..fc3e6e2 100644
+index 91d2c2b..3b907bd 100644
 --- a/xen/arch/x86/mm.c
 +++ b/xen/arch/x86/mm.c
-@@ -1017,6 +1017,20 @@ get_page_from_l4e(
+@@ -1019,6 +1019,20 @@ get_page_from_l4e(
      } while ( 0 )
  #endif
  
@@ -1697,7 +1731,7 @@ index 77dcafc..fc3e6e2 100644
  #define adjust_guest_l2e(pl2e, d)                               \
      do {                                                        \
          if ( likely(l2e_get_flags((pl2e)) & _PAGE_PRESENT) &&   \
-@@ -1209,7 +1223,14 @@ static int alloc_l1_table(struct page_info *page)
+@@ -1211,7 +1225,14 @@ static int alloc_l1_table(struct page_info *page)
                  break;
              }
  
@@ -1712,7 +1746,7 @@ index 77dcafc..fc3e6e2 100644
      }
  
      unmap_domain_page(pl1e);
-@@ -1699,10 +1720,37 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
+@@ -1702,10 +1723,37 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
              return -EINVAL;
          }
  
@@ -1750,7 +1784,7 @@ index 77dcafc..fc3e6e2 100644
              if ( UPDATE_ENTRY(l1, pl1e, ol1e, nl1e, gl1mfn, pt_vcpu,
                                preserve_ad) )
              {
-@@ -1732,6 +1780,7 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
+@@ -1735,6 +1783,7 @@ static int mod_l1_entry(l1_pgentry_t *pl1e, l1_pgentry_t nl1e,
              put_page(page);
  
          adjust_guest_l1e(nl1e, pt_dom);
@@ -1952,7 +1986,7 @@ index 3733c7a..b27a5e4 100644
          if ( !guest_handle_okay(set_iobitmap.bitmap, IOBMP_BYTES) ||
               (set_iobitmap.nr_ports > 65536) )
 diff --git a/xen/arch/x86/platform_hypercall.c b/xen/arch/x86/platform_hypercall.c
-index 7175a82..f9b881d 100644
+index 2162811..3e9a295 100644
 --- a/xen/arch/x86/platform_hypercall.c
 +++ b/xen/arch/x86/platform_hypercall.c
 @@ -30,6 +30,7 @@
@@ -1963,7 +1997,7 @@ index 7175a82..f9b881d 100644
  #include "cpu/mtrr/mtrr.h"
  #include <xsm/xsm.h>
  
-@@ -597,6 +598,14 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
+@@ -601,6 +602,14 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
      }
      break;
  
@@ -1979,7 +2013,7 @@ index 7175a82..f9b881d 100644
          ret = -ENOSYS;
          break;
 diff --git a/xen/arch/x86/traps.c b/xen/arch/x86/traps.c
-index 57dbd0c..76c169b 100644
+index adc5009..af51f9f 100644
 --- a/xen/arch/x86/traps.c
 +++ b/xen/arch/x86/traps.c
 @@ -73,6 +73,7 @@
@@ -1999,7 +2033,7 @@ index 57dbd0c..76c169b 100644
      int trapnr, const struct cpu_user_regs *regs, int use_error_code)
  {
      struct vcpu *v = current;
-@@ -1326,6 +1327,11 @@ static int fixup_page_fault(unsigned long addr, struct cpu_user_regs *regs)
+@@ -1343,6 +1344,11 @@ static int fixup_page_fault(unsigned long addr, struct cpu_user_regs *regs)
          return ret;
      }
  
@@ -2011,7 +2045,7 @@ index 57dbd0c..76c169b 100644
      return 0;
  }
  
-@@ -1587,6 +1593,8 @@ static int guest_io_okay(
+@@ -1604,6 +1610,8 @@ static int guest_io_okay(
      {
          union { uint8_t bytes[2]; uint16_t mask; } x;
  
@@ -2020,7 +2054,7 @@ index 57dbd0c..76c169b 100644
          /*
           * Grab permission bytes from guest space. Inaccessible bytes are
           * read as 0xff (no access allowed).
-@@ -1728,6 +1736,67 @@ static uint32_t guest_io_read(
+@@ -1745,6 +1753,67 @@ static uint32_t guest_io_read(
      return data;
  }
  
@@ -2088,7 +2122,7 @@ index 57dbd0c..76c169b 100644
  static void guest_io_write(
      unsigned int port, unsigned int bytes, uint32_t data,
      struct vcpu *v, struct cpu_user_regs *regs)
-@@ -2010,6 +2079,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2027,6 +2096,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
                   (rd_ad(edi) > (data_limit - (op_bytes - 1))) ||
                   !guest_io_okay(port, op_bytes, v, regs) )
                  goto fail;
@@ -2097,7 +2131,7 @@ index 57dbd0c..76c169b 100644
              data = guest_io_read(port, op_bytes, v, regs);
              if ( (rc = copy_to_user((void *)data_base + rd_ad(edi),
                                      &data, op_bytes)) != 0 )
-@@ -2036,9 +2107,14 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2053,9 +2124,14 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
                                       + op_bytes - rc, 0);
                  return EXCRET_fault_fixed;
              }
@@ -2114,7 +2148,7 @@ index 57dbd0c..76c169b 100644
              break;
          }
  
-@@ -2093,6 +2169,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2110,6 +2186,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
      exec_in:
          if ( !guest_io_okay(port, op_bytes, v, regs) )
              goto fail;
@@ -2123,7 +2157,7 @@ index 57dbd0c..76c169b 100644
          if ( admin_io_okay(port, op_bytes, v, regs) )
          {
              mark_regs_dirty(regs);
-@@ -2123,6 +2201,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
+@@ -2140,6 +2218,8 @@ static int emulate_privileged_op(struct cpu_user_regs *regs)
      exec_out:
          if ( !guest_io_okay(port, op_bytes, v, regs) )
              goto fail;
@@ -2939,10 +2973,10 @@ index 0000000..48d48ca
 +	return r;
 +}
 diff --git a/xen/arch/x86/x86_emulate/x86_emulate.c b/xen/arch/x86/x86_emulate/x86_emulate.c
-index 462d7c7..667e109 100644
+index e390c2a..932a104 100644
 --- a/xen/arch/x86/x86_emulate/x86_emulate.c
 +++ b/xen/arch/x86/x86_emulate/x86_emulate.c
-@@ -4198,7 +4198,9 @@ x86_emulate(
+@@ -4196,7 +4196,9 @@ x86_emulate(
          if ( !rc && (b != 0x6f) && (ea.type == OP_MEM) )
              rc = ops->write(ea.mem.seg, ea.mem.off, mmvalp,
                              ea.bytes, ctxt);
@@ -3063,7 +3097,7 @@ index f09c0c4..050a775 100644
 +    return next_range(r, y);
 +}
 diff --git a/xen/include/asm-x86/domain.h b/xen/include/asm-x86/domain.h
-index d79464d..c1fd46b 100644
+index 909f449..dfe15b4 100644
 --- a/xen/include/asm-x86/domain.h
 +++ b/xen/include/asm-x86/domain.h
 @@ -214,7 +214,14 @@ struct paging_vcpu {
@@ -3134,7 +3168,7 @@ index 27b3de5..6101397 100644
  #endif /* __ASM_X86_HVM_DOMAIN_H__ */
  
 diff --git a/xen/include/asm-x86/hvm/hvm.h b/xen/include/asm-x86/hvm/hvm.h
-index 8408420..388b2db 100644
+index 4d303e6..151d24a 100644
 --- a/xen/include/asm-x86/hvm/hvm.h
 +++ b/xen/include/asm-x86/hvm/hvm.h
 @@ -194,6 +194,11 @@ struct hvm_function_table {
@@ -3242,7 +3276,7 @@ index 43583b2..2656de0 100644
  
  /*
 diff --git a/xen/include/asm-x86/page.h b/xen/include/asm-x86/page.h
-index 998a0c7..0812f44 100644
+index 2c3cc2d..e2d3e86 100644
 --- a/xen/include/asm-x86/page.h
 +++ b/xen/include/asm-x86/page.h
 @@ -71,6 +71,10 @@
@@ -3631,7 +3665,7 @@ index e888daf..5fa5066 100644
  
  /*
 diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
-index 3cab74f..8ac4740 100644
+index fe179b9..4c6021a 100644
 --- a/xen/include/public/xen.h
 +++ b/xen/include/public/xen.h
 @@ -789,6 +789,7 @@ struct xen_multiboot_mod_list
