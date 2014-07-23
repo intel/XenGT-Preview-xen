@@ -479,10 +479,10 @@ index 0c32d0b..bf29699 100644
  
          break;
 diff --git a/tools/libxl/libxl_dm.c b/tools/libxl/libxl_dm.c
-index 7e54c02..512d50e 100644
+index 7e54c02..ded1bf9 100644
 --- a/tools/libxl/libxl_dm.c
 +++ b/tools/libxl/libxl_dm.c
-@@ -185,12 +185,32 @@ static char ** libxl__build_device_model_args_old(libxl__gc *gc,
+@@ -185,12 +185,36 @@ static char ** libxl__build_device_model_args_old(libxl__gc *gc,
                      NULL);
          }
  
@@ -510,6 +510,10 @@ index 7e54c02..512d50e 100644
 +                flexarray_vappend(dm_args, "-vgt_primary",
 +                    libxl__sprintf(gc, "%d", b_info->u.hvm.vgt_primary), NULL);
 +            }
++            if (b_info->u.hvm.vgt_monitor_config_file) {
++                flexarray_vappend(dm_args, "-vgt_monitor_config_file",
++                    libxl__sprintf(gc, "%s", b_info->u.hvm.vgt_monitor_config_file), NULL);
++            }
 +        } else {
 +            switch (b_info->u.hvm.vga.kind) {
 +            case LIBXL_VGA_INTERFACE_TYPE_STD:
@@ -521,7 +525,7 @@ index 7e54c02..512d50e 100644
          }
  
          if (b_info->u.hvm.boot) {
-@@ -465,19 +485,40 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
+@@ -465,19 +489,44 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
              flexarray_append(dm_args, spiceoptions);
          }
  
@@ -556,6 +560,10 @@ index 7e54c02..512d50e 100644
              }
 -            break;
 -        }
++            if (b_info->u.hvm.vgt_monitor_config_file) {
++                flexarray_vappend(dm_args, "-vgt_monitor_config_file",
++                    libxl__sprintf(gc, "%s", b_info->u.hvm.vgt_monitor_config_file), NULL);
++            }
 +	} else {
 +		switch (b_info->u.hvm.vga.kind) {
 +			case LIBXL_VGA_INTERFACE_TYPE_STD:
@@ -574,25 +582,8 @@ index 7e54c02..512d50e 100644
  
          if (b_info->u.hvm.boot) {
              flexarray_vappend(dm_args, "-boot",
-diff --git a/tools/libxl/libxl_pci.c b/tools/libxl/libxl_pci.c
-index 88bf91e..5eb6196 100644
---- a/tools/libxl/libxl_pci.c
-+++ b/tools/libxl/libxl_pci.c
-@@ -1070,7 +1070,11 @@ int libxl__device_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcide
-         goto out;
-     }
- 
--    libxl__device_pci_reset(gc, pcidev->domain, pcidev->bus, pcidev->dev, pcidev->func);
-+    if (pcidev->bus == 0 && pcidev-> dev == 2 && pcidev->func == 0) {
-+        printf("xuanhua: %s, %d: for HVM we do not reset pci device (00:02:0)\n", __func__, __LINE__);
-+        fflush(stdout);
-+    } else
-+        libxl__device_pci_reset(gc, pcidev->domain, pcidev->bus, pcidev->dev, pcidev->func);
- 
-     stubdomid = libxl_get_stubdom_id(ctx, domid);
-     if (stubdomid != 0) {
 diff --git a/tools/libxl/libxl_types.idl b/tools/libxl/libxl_types.idl
-index d218a2d..11a7a59 100644
+index d218a2d..6af715c 100644
 --- a/tools/libxl/libxl_types.idl
 +++ b/tools/libxl/libxl_types.idl
 @@ -23,6 +23,7 @@ libxl_hwcap = Builtin("hwcap", passby=PASS_BY_REFERENCE)
@@ -603,7 +594,7 @@ index d218a2d..11a7a59 100644
  
  #
  # Constants / Enumerations
-@@ -314,12 +315,17 @@ libxl_domain_build_info = Struct("domain_build_info",[
+@@ -314,12 +315,18 @@ libxl_domain_build_info = Struct("domain_build_info",[
                                         ("acpi_firmware",    string),
                                         ("nographic",        libxl_defbool),
                                         ("vga",              libxl_vga_interface_info),
@@ -612,6 +603,7 @@ index d218a2d..11a7a59 100644
 +                                       ("vgt_high_gm_sz",        VgtInt),
 +                                       ("vgt_fence_sz",     VgtInt),
 +                                       ("vgt_primary",     VgtInt),
++                                       ("vgt_monitor_config_file", string),
                                         ("vnc",              libxl_vnc_info),
                                         # keyboard layout, default is en-us keyboard
                                         ("keymap",           string),
@@ -623,10 +615,10 @@ index d218a2d..11a7a59 100644
                                         
                                         ("serial",           string),
 diff --git a/tools/libxl/xl_cmdimpl.c b/tools/libxl/xl_cmdimpl.c
-index f5943a4..c208d23 100644
+index f5943a4..7885671 100644
 --- a/tools/libxl/xl_cmdimpl.c
 +++ b/tools/libxl/xl_cmdimpl.c
-@@ -1464,6 +1464,17 @@ skip_vfb:
+@@ -1464,6 +1464,18 @@ skip_vfb:
              b_info->u.hvm.vga.kind = l ? LIBXL_VGA_INTERFACE_TYPE_STD :
                                           LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
  
@@ -641,6 +633,7 @@ index f5943a4..c208d23 100644
 +            b_info->u.hvm.vgt_primary = l;
 +        else
 +            b_info->u.hvm.vgt_primary = -1; /* not specified */
++        xlu_cfg_replace_string (config, "vgt_monitor_config_file", &b_info->u.hvm.vgt_monitor_config_file, 0);
          xlu_cfg_get_defbool(config, "vnc", &b_info->u.hvm.vnc.enable, 0);
          xlu_cfg_replace_string (config, "vnclisten",
                                  &b_info->u.hvm.vnc.listen, 0);
@@ -1030,7 +1023,7 @@ index b206997..44877fa 100644
  
  int hvmemul_do_pio(
 diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
-index 4cf503b..0d0c97c 100644
+index 4cf503b..e0700f9 100644
 --- a/xen/arch/x86/hvm/hvm.c
 +++ b/xen/arch/x86/hvm/hvm.c
 @@ -59,6 +59,7 @@
@@ -1309,7 +1302,7 @@ index 4cf503b..0d0c97c 100644
 +            rc = -EINVAL;
 +        }
 +	else {
-+	    hap_write_protect_pages(d, wp.wp_pages, wp.nr_pages, wp.set);
++	    rc = hap_write_protect_pages(d, wp.wp_pages, wp.nr_pages, wp.set);
 +	}
 +        rcu_unlock_domain(d);
 +
@@ -1430,10 +1423,10 @@ index 5f5009a..6d6d434 100644
      }
 diff --git a/xen/arch/x86/hvm/vgt.c b/xen/arch/x86/hvm/vgt.c
 new file mode 100644
-index 0000000..ae24d90
+index 0000000..61cb09b
 --- /dev/null
 +++ b/xen/arch/x86/hvm/vgt.c
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,234 @@
 +/*
 + * vgt.c: code to trace the vGT MMIO access in HVM domain
 + *
@@ -1533,24 +1526,28 @@ index 0000000..ae24d90
 +};
 +
 +
-+void vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn)
++int vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn)
 +{
 +    int index = wp_hash(gpfn);
 +    struct wp_hash_table *ne;
 +
-+    ASSERT( lookup_wp_hash_table(wp_ht, gpfn) == NULL );
++    if ( lookup_wp_hash_table(wp_ht, gpfn) != NULL )
++        return -EINVAL;
 +    if (wp_ht[index].gpfn == WP_INVALID_GPFN)
 +        wp_ht[index].gpfn = gpfn;
 +    else {
 +        /* self-automicity */
 +        ne = xmalloc_bytes(sizeof(wp_ht[0]));
++	if ( ne == NULL )
++	    return -ENOMEM;
 +	ne->next = wp_ht[index].next;
 +	ne->gpfn = gpfn;
 +	wp_ht[index].next = ne;
 +    }
++    return 0;
 +}
 +
-+void vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn)
++int vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn)
 +{
 +    int index = wp_hash(gpfn);
 +    struct wp_hash_table *next, *prev;
@@ -1565,17 +1562,18 @@ index 0000000..ae24d90
 +	    if ( next == NULL ) {
 +	        printk("vgt_wp_hash_rem hash_table %p remove %lx not found\n",
 +			   wp_ht, gpfn);
-+	        return;
++	        return -EINVAL;
 +	    }
 +	    if (next->gpfn == gpfn) {
 +  	        /* self-automicity */
 + 	        prev->next = next->next;
 + 	        xfree (next);
-+		return;
++		break;
 +	    }
 +	    prev = next;
 +	}
 +    }
++    return 0;
 +}
 +
 +struct wp_hash_table *lookup_wp_hash_table(
@@ -1900,10 +1898,10 @@ index 91d2c2b..3b907bd 100644
      /* Checked successfully: do the update (write or cmpxchg). */
      pl1e = map_domain_page(mfn);
 diff --git a/xen/arch/x86/mm/hap/hap.c b/xen/arch/x86/mm/hap/hap.c
-index bff05d9..15bb46d 100644
+index bff05d9..5b89c0c 100644
 --- a/xen/arch/x86/mm/hap/hap.c
 +++ b/xen/arch/x86/mm/hap/hap.c
-@@ -208,6 +208,45 @@ void hap_logdirty_init(struct domain *d)
+@@ -208,6 +208,46 @@ void hap_logdirty_init(struct domain *d)
                            hap_clean_dirty_bitmap);
  }
  
@@ -1921,6 +1919,7 @@ index bff05d9..15bb46d 100644
 +{
 +    int i;
 +    p2m_type_t  ot, nt;
++    int ret = 0;
 +
 +    if ( wr ) {
 +        ot = p2m_ram_rw;
@@ -1935,15 +1934,15 @@ index bff05d9..15bb46d 100644
 +    for ( i=0; i < num; i++) {
 +        p2m_change_type_range(d, gpfn[i], gpfn[i] + 1, ot, nt);
 +	if (wr)
-+            vgt_wp_hash_add(wp_htable(d), gpfn[i]);
++            ret = vgt_wp_hash_add(wp_htable(d), gpfn[i]);
 +	else
-+            vgt_wp_hash_rem(wp_htable(d), gpfn[i]);
++            ret = vgt_wp_hash_rem(wp_htable(d), gpfn[i]);
 +    }
 +
 +    spin_unlock(&wp_htable_lock(d));
 +
 +    flush_tlb_mask(d->domain_dirty_cpumask);
-+    return 0;
++    return ret;
 +}
 +
  /************************************************/
@@ -2168,10 +2167,10 @@ index adc5009..af51f9f 100644
              mark_regs_dirty(regs);
 diff --git a/xen/arch/x86/vgt.c b/xen/arch/x86/vgt.c
 new file mode 100644
-index 0000000..48d48ca
+index 0000000..1e45486
 --- /dev/null
 +++ b/xen/arch/x86/vgt.c
-@@ -0,0 +1,800 @@
+@@ -0,0 +1,808 @@
 +/*
 + * vgt.c: core logic to handle mediated GT passthrough
 + * Copyright (c) 2011, Intel Corporation.
@@ -2819,14 +2818,15 @@ index 0000000..48d48ca
 +
 +    printk("Enable vGT for domain %d\n", d->domain_id);
 +
++    wp_htable(d) = xmalloc_bytes(WP_HASH_ENTRY_SIZE * WP_HASH_SIZE);
++    if ( wp_htable(d) == NULL )
++        return  -ENOMEM;
++
 +    d->arch.hvm_domain.vgt_enabled = 1;
 +
 +    register_portio_handler(d, 0xcf8, 8, vgt_intercept_cf8_cfc);
 +
-+    wp_htable(d) = xmalloc_bytes(WP_HASH_ENTRY_SIZE * WP_HASH_SIZE);
 +    memset (wp_htable(d), 0, WP_HASH_ENTRY_SIZE * WP_HASH_SIZE);
-+
-+    ASSERT ( wp_htable(d) != NULL );
 +
 +    /* FIXME: get the PIO & MMIO base&size */
 +//  register_portio_handler(d, vgt_pio_base, vgt_pio_size, vgt_intercept_io);
@@ -2900,6 +2900,13 @@ index 0000000..48d48ca
 +		rangeset_destroy(d->iomem_forward_caps);
 +		d->iomem_forward_caps = rangeset_new(d, "I/O Memory Forwarding",
 +                                     RANGESETF_prettyprint_hex);
++
++		if (!d->iomem_forward_caps) {
++			printk("VGT(%d): fail to allocate rangeset for io trap.\n",
++				d->domain_id);
++			return -ENOMEM;
++		}
++
 +		rs = d->iomem_forward_caps;
 +
 +		for (i = 0; i < info->n_mmio; i++) {
@@ -3125,7 +3132,7 @@ index 909f449..dfe15b4 100644
      uint8_t cmos_idx;
  
 diff --git a/xen/include/asm-x86/hvm/domain.h b/xen/include/asm-x86/hvm/domain.h
-index 27b3de5..6101397 100644
+index 27b3de5..74375a8 100644
 --- a/xen/include/asm-x86/hvm/domain.h
 +++ b/xen/include/asm-x86/hvm/domain.h
 @@ -41,6 +41,24 @@ struct hvm_ioreq_page {
@@ -3143,8 +3150,8 @@ index 27b3de5..6101397 100644
 +#define WP_HASH_ENTRY_SIZE   sizeof(struct wp_hash_table)
 +#define wp_htable(d)   (d->arch.hvm_domain.vgt_wp_hash_base)
 +#define wp_htable_lock(d)   (d->arch.hvm_domain.vgt_wp_hash_lock)
-+void vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn);
-+void vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn);
++int vgt_wp_hash_add(struct wp_hash_table *wp_ht, unsigned long gpfn);
++int vgt_wp_hash_rem(struct wp_hash_table *wp_ht, unsigned long gpfn);
 +struct wp_hash_table *lookup_wp_hash_table(
 +    struct wp_hash_table *wp_ht,
 +    unsigned long gpfn);
