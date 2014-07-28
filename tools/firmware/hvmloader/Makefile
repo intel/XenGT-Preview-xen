@@ -120,6 +120,11 @@ ifneq ($(STDVGA_ROM),)
 	echo "#ifdef ROM_INCLUDE_VGABIOS" >> $@.new
 	sh ./mkhex vgabios_stdvga $(STDVGA_ROM) >> $@.new
 	echo "#endif" >> $@.new
+
+	echo "#ifdef SEABIOS_INCLUDE_VGABIOS" >> $@.new
+	sh ./mkhex seabios_vgabios_stdvga $(STDVGA_ROM) >> $@.new
+	echo "#endif" >> $@.new
+
 endif
 ifneq ($(CIRRUSVGA_ROM),)
 	echo "#ifdef ROM_INCLUDE_VGABIOS" >> $@.new
