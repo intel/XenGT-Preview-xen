@@ -24,6 +24,7 @@
 #include "hypercall.h"
 #include "config.h"
 #include "pci_regs.h"
+#include "vgt.h"
 
 #include <xen/memory.h>
 #include <xen/hvm/ioreq.h>
@@ -46,6 +47,7 @@ void pci_setup(void)
     uint32_t vga_devfn = 256;
     uint16_t class, vendor_id, device_id;
     unsigned int bar, pin, link, isa_irq;
+    uint8_t is_x8086 = 0;
 
     /* Resources assignable to PCI devices via BARs. */
     struct resource {
@@ -136,17 +138,9 @@ void pci_setup(void)
             {
                 vga_devfn = devfn;
                 virtual_vga = VGA_pt;
+
                 if ( vendor_id == 0x8086 )
-                {
-                    igd_opregion_pgbase = mem_hole_alloc(IGD_OPREGION_PAGES);
-                    /*
-                     * Write the the OpRegion offset to give the opregion
-                     * address to the device model. The device model will trap 
-                     * and map the OpRegion at the give address.
-                     */
-                    pci_writel(vga_devfn, PCI_INTEL_OPREGION,
-                               igd_opregion_pgbase << PAGE_SHIFT);
-                }
+                    is_x8086 = 1;
             }
             break;
         case 0x0680:
@@ -439,6 +433,41 @@ void pci_setup(void)
 
     if ( vga_devfn != 256 )
     {
+        if ( is_x8086 )
+        {
+            uint32_t bar = pci_readl(vga_devfn, PCI_BASE_ADDRESS_0)
+                                        & PCI_BASE_ADDRESS_MEM_MASK;
+
+            void *pvinfo = (void *)bar + VGT_PVINFO_PAGE;
+            uint64_t *magic = pvinfo;
+
+            if (*magic == VGT_MAGIC) {
+                /*
+                 * Found VGT device, and use standard VGA bios.
+                 */
+                virtual_vga = VGA_vgt;
+
+                /* XXX: we use this hack to tell vGT driver the
+                 * top of <4G mem, so vGT can avoid unnecessary
+                 * attempts to map the mem hole. This optimization
+                 * can speed up guest bootup time and improve Win7
+                 * SMP guest's stability.
+                 * NOTE: here we're actually trying to write 32 bits
+                 * into VENDOR_ID and DEVICE_ID -- we assume normally
+                 * sane codes in guest won't do this...
+                 */
+                 pci_writel(vga_devfn, PCI_VENDOR_ID, hvm_info->low_mem_pgend);
+            }
+
+            igd_opregion_pgbase = mem_hole_alloc(IGD_OPREGION_PAGES);
+            /*
+             * Write the the OpRegion offset to give the opregion
+             * address to the device model. The device model will trap 
+             * and map the OpRegion at the give address.
+             */
+            pci_writel(vga_devfn, PCI_INTEL_OPREGION,
+                       igd_opregion_pgbase << PAGE_SHIFT);
+        }
         /*
          * VGA registers live in I/O space so ensure that primary VGA
          * has IO enabled, even if there is no I/O BAR on that
