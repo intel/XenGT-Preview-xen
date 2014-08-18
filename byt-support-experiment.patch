@@ -1,0 +1,230 @@
+diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
+index 767a35c..82170e5 100644
+--- a/tools/firmware/hvmloader/pci.c
++++ b/tools/firmware/hvmloader/pci.c
+@@ -129,9 +129,9 @@ void pci_setup(void)
+                 vga_devfn = devfn;
+                 virtual_vga = VGA_cirrus;
+             }
+-            else if ( (vendor_id == 0x8086) && 
++            else if ( (vendor_id == 0x8086) &&
+                       (_is_sandybridge(device_id) || _is_ivybridge(device_id)
+-                       || _is_haswell(device_id) )
++                       || _is_haswell(device_id) || _is_valleyview(device_id))
+                     )
+             {
+                 printf("Detect Intel Graphics Device\n");
+diff --git a/tools/firmware/hvmloader/vgt.h b/tools/firmware/hvmloader/vgt.h
+index afec057..3e0fb53 100644
+--- a/tools/firmware/hvmloader/vgt.h
++++ b/tools/firmware/hvmloader/vgt.h
+@@ -43,6 +43,26 @@ static inline int _is_sandybridge(int devid)
+     return ret;
+ }
+ 
++static inline int _is_valleyview(int devid)
++{
++    int ret = 0;
++
++    switch (devid) {
++	case 0x0f30:
++	case 0x0f31:
++	case 0x0f32:
++	case 0x0f33:
++	case 0x0155:
++	case 0x0157:
++            ret = 1;
++            break;
++        default:
++            break;
++    }
++    return ret;
++
++}
++
+ static inline int _is_ivybridge(int devid)
+ {
+     int ret = 0;
+diff --git a/xen/arch/x86/vgt.c b/xen/arch/x86/vgt.c
+index 1e45486..4cf2841 100644
+--- a/xen/arch/x86/vgt.c
++++ b/xen/arch/x86/vgt.c
+@@ -65,12 +65,20 @@ void (*vgt_force_wake_put)(void);
+ #define VGT_REG_WRITE(offset, val)	*((volatile u32 *)(vgt_mmio_hva + offset)) = (val)
+ 
+ #define  FORCEWAKE                              0xA18C
++static unsigned int _forcewake1  =  FORCEWAKE;
++static unsigned int _forcewake2  =  FORCEWAKE;
+ #define  FORCEWAKE_ACK_HSW                      0x130044
+ #define  FORCEWAKE_ACK                          0x130090
+ #define  FORCEWAKE_MT                           0xa188 /* multi-threaded */
+ #define  FORCEWAKE_MT_ACK                       0x130040
+ #define  ECOBUS                                 0xa180
+ #define    FORCEWAKE_MT_ENABLE                  (1<<5)
++#define _REG_VLV_FORCEWAKE                      0x1300b0
++#define _REG_VLV_FORCEWAKE_ACK                  0x1300b4
++#define _REG_VLV_FORCEWAKE_MEDIA                0x1300b8
++#define _REG_VLV_FORCEWAKE_MEDIA_ACK            0x1300bc
++
++
+ 
+ #define  GTFIFODBG                              0x120000
+ #define    GT_FIFO_CPU_ERROR_MASK               7
+@@ -100,7 +108,12 @@ void (*vgt_force_wake_put)(void);
+ 		        ret__;                          \
+ 		})
+ 
+-#define NEED_FORCE_WAKE(reg)	(((reg) - vgt_mmio_bar_start) < 0x40000 && ((reg) - vgt_mmio_bar_start) != FORCEWAKE)
++#define NEED_FORCE_WAKE(reg)	(((reg) - vgt_mmio_bar_start) < 0x40000 && ((reg) - vgt_mmio_bar_start) != _forcewake1 && ((reg) - vgt_mmio_bar_start) != _forcewake2) 
++
++
++#define NEEDS_FORCE_WAKE_VLV_FIX(reg) ((reg)< 0x40000 && (reg != _REG_VLV_FORCEWAKE)&& (reg != _REG_VLV_FORCEWAKE_MEDIA))
++#define NEEDS_FORCE_WAKE_VLV(reg) NEEDS_FORCE_WAKE_VLV_FIX ((reg) - vgt_mmio_bar_start)
++
+ 
+ static void gen6_wait_for_thread_c0(void)
+ {
+@@ -137,28 +150,55 @@ void gen6_force_wake_get (void)
+ 
+ 	WARN_ON(igd_gen == XEN_IGD_INVALID);
+ 
+-	if (igd_gen == XEN_IGD_HSW)
+-		forcewake_ack = FORCEWAKE_ACK_HSW;
+-	else
+-		forcewake_ack = FORCEWAKE_ACK;
++	if(igd_gen == XEN_IGD_VLV) {
++		/* For VLV, repeat for GT twice, one for render, one for media */
++		/* First we do render */
++		forcewake_ack = _REG_VLV_FORCEWAKE_ACK;
++		if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1) == 0, 2000))
++			VGT_ERR("VLV Force wake wait timed out on prior\n");
++		VGT_REG_WRITE(_REG_VLV_FORCEWAKE,  _MASKED_BIT_ENABLE(1));
++		VGT_REG_WRITE(_REG_VLV_FORCEWAKE_MEDIA,  _MASKED_BIT_ENABLE(1));
++
++		if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 2000)) {
++			VGT_ERR("VLV Force wake wait timed out on new\n");
++		}
++		/* Next we do media */
++		forcewake_ack = _REG_VLV_FORCEWAKE_MEDIA_ACK;
++		if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 2000)) {
++			VGT_ERR("VLV Force wake media wait timed out on new\n");
++		}
+ 
+-	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1) == 0, 500))
+-		VGT_ERR("Force wake wait timed out\n");
++	} else {
++		if (igd_gen == XEN_IGD_HSW)
++			forcewake_ack = FORCEWAKE_ACK_HSW;
++		else
++			forcewake_ack = FORCEWAKE_ACK;
+ 
+-	VGT_REG_WRITE(FORCEWAKE, 1);
+-	VGT_REG_READ(ECOBUS);
++		if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1) == 0, 500))
++			VGT_ERR("Force wake wait timed out\n");
+ 
+-	if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 500))
+-		VGT_ERR("Force wake wait timed out\n");
++		VGT_REG_WRITE(FORCEWAKE, 1);
++		VGT_REG_READ(ECOBUS);
++
++		if (wait_for_atomic_us((VGT_REG_READ(forcewake_ack) & 1), 500))
++			VGT_ERR("Force wake wait timed out\n");
++	}
+ 
+ 	gen6_wait_for_thread_c0();
+ }
+ 
+ void gen6_force_wake_put (void)
+ {
+-	VGT_REG_WRITE(FORCEWAKE, 0);
+-	VGT_REG_READ(ECOBUS);
+-	gen6_gt_check_fifodbg();
++	if(igd_gen == XEN_IGD_VLV) {
++		/* For VLV, repeat for GT twice, one for render, one for media */
++		VGT_REG_WRITE(_REG_VLV_FORCEWAKE,  _MASKED_BIT_DISABLE(1));
++		VGT_REG_WRITE(_REG_VLV_FORCEWAKE_MEDIA, _MASKED_BIT_DISABLE(1));
++		gen6_gt_check_fifodbg();
++	} else {
++		VGT_REG_WRITE(FORCEWAKE, 0);
++		VGT_REG_READ(ECOBUS);
++		gen6_gt_check_fifodbg();
++	}
+ }
+ 
+ void gen7_force_wake_mt_get (void)
+@@ -253,9 +293,15 @@ int set_vgt_info(unsigned int gen_dev_bdf, unsigned int gen_dev_type)
+     vgt_force_wake_get = gen6_force_wake_get;
+     vgt_force_wake_put = gen6_force_wake_put;
+     VGT_LOG("Set default force wake\n");
++
++	if ( igd_gen == XEN_IGD_VLV) {
++	 _forcewake1  =  _REG_VLV_FORCEWAKE;
++	 _forcewake2  =  _REG_VLV_FORCEWAKE_MEDIA;
++	}
+ 
+     if ( igd_gen == XEN_IGD_IVB || igd_gen == XEN_IGD_HSW )
+     {
++		/* DONT include VLV - since VLV has no ppgt and thus no multi wake */
+         int ecobus;
+ 
+         gen7_force_wake_mt_get();
+@@ -423,9 +469,18 @@ int hypercall_io_emulation(struct vcpu *v, struct vcpu_emul_ioreq *req)
+ 
+ 	if ( req->dir == PV_IOREQ_READ )
+         {
+-	    if (NEED_FORCE_WAKE(req->addr) && (force_wake_state == FORCE_WAKE_STATE_OFF)) {
+-		    force_wake = 1;
+-		    vgt_force_wake_get();
++
++		if(igd_gen == XEN_IGD_VLV)  {
++            if (NEEDS_FORCE_WAKE_VLV(req->addr) && (force_wake_state == FORCE_WAKE_STATE_OFF)) {
++                    force_wake = 1;
++                    vgt_force_wake_get();
++            }
++
++	    } else {
++		    if (NEED_FORCE_WAKE(req->addr) && (force_wake_state == FORCE_WAKE_STATE_OFF)) {
++			    force_wake = 1;
++			    vgt_force_wake_get();
++		    }
+ 	    }
+ 
+             req->data = 0;
+@@ -455,11 +510,17 @@ int hypercall_io_emulation(struct vcpu *v, struct vcpu_emul_ioreq *req)
+         else
+         {
+ 	    int fifo_ret = 0;
+-	    if (NEED_FORCE_WAKE(req->addr)) {
+-		    force_wake = 1;
+-		    fifo_ret = gen6_gt_wait_for_fifo();
+-	    }
+-
++		if(igd_gen == XEN_IGD_VLV)  {
++	    	if (NEEDS_FORCE_WAKE_VLV(req->addr)) {
++			    force_wake = 1;
++			    fifo_ret = gen6_gt_wait_for_fifo();
++	    	}
++		} else {
++	    	if (NEED_FORCE_WAKE(req->addr)) {
++			    force_wake = 1;
++			    fifo_ret = gen6_gt_wait_for_fifo();
++			}
++		}
+             switch ( req->size )
+             {
+             case 1:
+diff --git a/xen/include/public/platform.h b/xen/include/public/platform.h
+index 7688c8b..745dc0e 100644
+--- a/xen/include/public/platform.h
++++ b/xen/include/public/platform.h
+@@ -533,7 +533,8 @@ DEFINE_XEN_GUEST_HANDLE(xenpf_core_parking_t);
+ #define XEN_IGD_SNB     1
+ #define XEN_IGD_IVB     2
+ #define XEN_IGD_HSW     3
+-#define XEN_IGD_MAX     3   /* the max GEN dev type supported */
++#define XEN_IGD_VLV     4
++#define XEN_IGD_MAX     4   /* the max GEN dev type supported */
+ struct xenpf_vgt_info {
+     unsigned int gen_dev_bdf;
+     unsigned int gen_dev_type;
