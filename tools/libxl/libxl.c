@@ -1472,6 +1472,30 @@ static void domain_destroy_callback(libxl__egc *egc,
 static void destroy_finish_check(libxl__egc *egc,
                                  libxl__domain_destroy_state *dds);
 
+/* We don't care the return value:
+ * 1) the guest may not be a VGT guest;
+ * 2) normally when a VGT guest shutdown, the ioemu has already tried to
+ * destroy the vgt instance and we shouldn't come here by "xl dest dom_id".
+ * 3) we come here because the ioemu didn't destroy the vgt instance
+ * successfully(e.g., ioemu exits abnormally) or we want to kill the guest by
+ * force while it's running. In this case, we still try our best to destroy
+ * the vgt instance.
+ */
+static void destroy_vgt_instance(int domid)
+{
+    const char *path = "/sys/kernel/vgt/control/create_vgt_instance";
+    FILE *vgt_file;
+
+    if (domid <= 0)
+        return;
+
+    if ((vgt_file = fopen(path, "w")) == NULL)
+        return;
+
+    (void)fprintf(vgt_file, "%d\n", -domid);
+    (void)fclose(vgt_file);
+}
+
 void libxl__domain_destroy(libxl__egc *egc, libxl__domain_destroy_state *dds)
 {
     STATE_AO_GC(dds->ao);
@@ -1660,6 +1684,8 @@ static void devices_destroy_cb(libxl__egc *egc,
         goto out;
     }
     libxl__userdata_destroyall(gc, domid);
+
+    destroy_vgt_instance(domid);
 
     rc = xc_domain_destroy(ctx->xch, domid);
     if (rc < 0) {
