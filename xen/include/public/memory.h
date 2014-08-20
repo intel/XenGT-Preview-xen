@@ -523,6 +523,32 @@ DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_op_t);
 
 #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
 
+/* zhangyu: still keep the value of XENMEM_get_mfn_from_pfn to 25, but may need to
+ * change to above 27, due to rebase, if changed, guest value need also be updated
+ */
+/*
+ * Translate the given guest PFNs to MFNs
+ */
+#define XENMEM_get_mfn_from_pfn    25
+struct xen_get_mfn_from_pfn {
+    /*
+     * Pointer to buffer to fill with list of pfn.
+     * for IN, it contains the guest PFN that need to translated
+     * for OUT, it contains the translated MFN. or INVALID_MFN if no valid translation
+     */
+    XEN_GUEST_HANDLE(xen_pfn_t) pfn_list;
+
+    /*
+     * IN: Size of the pfn_array.
+     */
+    unsigned int nr_pfns;
+
+    /* IN: which domain */
+    domid_t domid;
+};
+typedef struct xen_get_mfn_from_pfn xen_get_mfn_from_pfn_t;
+DEFINE_XEN_GUEST_HANDLE(xen_get_mfn_from_pfn_t);
+
 /*
  * XENMEM_get_vnumainfo used by guest to get
  * vNUMA topology from hypervisor.

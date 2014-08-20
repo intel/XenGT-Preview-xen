@@ -4658,6 +4658,61 @@ int xenmem_add_to_physmap_one(
     return rc;
 }
 
+static int get_mfn_from_pfn(XEN_GUEST_HANDLE(xen_get_mfn_from_pfn_t) arg)
+{
+    struct xen_get_mfn_from_pfn cmd_info;
+    struct domain *d;
+    int rc=0, i;
+    xen_pfn_t *pfns = NULL;
+    xen_pfn_t pfn;
+    struct p2m_domain *p2m;
+    p2m_type_t t;
+
+    if ( !is_hardware_domain(current->domain) )
+        return -EPERM;
+
+    if ( copy_from_guest(&cmd_info, arg, 1) )
+        return -EFAULT;
+
+    d = rcu_lock_domain_by_any_id(cmd_info.domid);
+    if ( d == NULL )
+        return -ESRCH;
+
+    /* sanity check for security */
+    if (cmd_info.nr_pfns > 2048 )
+        return -ENOMEM;
+
+    pfns = xmalloc_array(xen_pfn_t, cmd_info.nr_pfns);
+    if (pfns == NULL)
+        return -ENOMEM;
+
+    if (copy_from_guest(pfns, cmd_info.pfn_list, cmd_info.nr_pfns)){
+        rc = -EFAULT;
+        goto out;
+    }
+
+    p2m = p2m_get_hostp2m(d);
+    for(i=0; i < cmd_info.nr_pfns; i++){
+        pfn = pfns[i];
+        pfns[i] = mfn_x(get_gfn_query(d, pfn, &t));
+		if(pfns[i] == INVALID_MFN){
+			rc = -EINVAL;
+			goto out;
+		}
+		put_gfn(d, pfn);
+    }
+
+    if (copy_to_guest(cmd_info.pfn_list, pfns, cmd_info.nr_pfns)){
+        rc = -EFAULT;
+        goto out;
+    }
+
+out:
+    rcu_unlock_domain(d);
+    xfree(pfns);
+    return rc;
+}
+
 long arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 {
     int rc;
@@ -4878,6 +4933,15 @@ long arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         rcu_unlock_domain(d);
         return rc;
     }
+
+#ifdef __x86_64__
+    case XENMEM_get_sharing_freed_pages:
+        return mem_sharing_get_nr_saved_mfns();
+#endif
+
+    case XENMEM_get_mfn_from_pfn:
+        rc = get_mfn_from_pfn(guest_handle_cast(arg, xen_get_mfn_from_pfn_t));
+        break;
 
     default:
         return subarch_memory_op(cmd, arg);
