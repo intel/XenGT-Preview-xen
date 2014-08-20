@@ -1,0 +1,12 @@
+--- a/seabios-dir/src/optionroms.c
++++ b/seabios-dir/src/optionroms.c
+@@ -478,7 +478,8 @@ vga_setup(void)
+     S3ResumeVgaInit = romfile_loadint("etc/s3-resume-vga-init", 0);
+     ScreenAndDebug = romfile_loadint("etc/screen-and-debug", 1);
+
+-    if (CONFIG_OPTIONROMS_DEPLOYED) {
++    if (CONFIG_OPTIONROMS_DEPLOYED ||
++       ((*(u16 *)BUILD_ROM_START) == 0xaa55)) {
+         // Option roms are already deployed on the system.
+         init_optionrom((void*)BUILD_ROM_START, 0, 1);
+     } else {

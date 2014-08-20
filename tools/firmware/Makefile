@@ -25,6 +25,7 @@ ovmf-dir:
 
 seabios-dir:
 	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_REVISION) seabios-dir
+	patch -p1 < $(XEN_ROOT)/tools/firmware/xengt_seabios.patch
 	$(MAKE) -C seabios-dir defconfig
 
 .PHONY: all
