@@ -1,3 +1,60 @@
+diff --git a/Config.mk b/Config.mk
+index e4f3424..2e36d1a 100644
+--- a/Config.mk
++++ b/Config.mk
+@@ -208,11 +208,13 @@ QEMU_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/qemu-upstream-4.3-testing.g
+ SEABIOS_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/seabios.git
+ else
+ OVMF_UPSTREAM_URL ?= git://xenbits.xen.org/ovmf.git
+-QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-4.3-testing.git
++#QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-4.3-testing.git
++QEMU_UPSTREAM_URL ?= git://vgt.sh.intel.com/qemu-xen.git
+ SEABIOS_UPSTREAM_URL ?= git://xenbits.xen.org/seabios.git
+ endif
+ OVMF_UPSTREAM_REVISION ?= b0855f925c6e2e0b21fbb03fab4b5fb5b6876871
+-QEMU_UPSTREAM_REVISION ?= qemu-xen-4.3.1
++#QEMU_UPSTREAM_REVISION ?= qemu-xen-4.3.0
++QEMU_UPSTREAM_REVISION ?= 0280685a1a2f769b45946e44162e6ceacb7da3da
+ SEABIOS_UPSTREAM_TAG ?= 3a28511b46f0c2af5fae1b6ed2b0c19d7913cee3
+ # Wed Jun 26 16:30:45 2013 +0100
+ # xen: Don't perform SMP setup.
+diff --git a/INSTALL.vgt b/INSTALL.vgt
+new file mode 100644
+index 0000000..b0659aa
+--- /dev/null
++++ b/INSTALL.vgt
+@@ -0,0 +1,31 @@
++<preparation>
++~] git clone git clone git://vgt.sh.intel.com/xen-unstable.git xen-vgt.git
++~] cd xen-vgt.git
++xen-vgt.git] git clone git clone git://vgt.sh.intel.com/linux.git linux-2.6-pvops.git
++(linux-2.6-pvops.git is within xen-vgt.git)
++
++<build>
++xen-vgt.git] make -j8 xen
++xen-vgt.git] make KERNELS=*pvops kernels
++(when there's prompt for config options, exit the build by Ctrl-C)
++xen-vgt.git] cd build-linux-2.6-pvops_x86_64
++build-linux-2.6-pvops_x86_64] cp ../linux-2.6-pvops.git/config-3.2-rc4-dom0 .config
++build-linux-2.6-pvops_x86_64] make oldconfig
++build-linux-2.6-pvops_x86_64] make -j8
++
++<install>
++build-linux-2.6-pvops_x86_64] make modules_install
++build-linux-2.6-pvops_x86_64] mkinitd /boot/initrd-vgt.img 3.2.0-rc4+
++build-linux-2.6-pvops_x86_64] cp arch/x86/boot/bzImage /boot/dom0-vgt
++build-linux-2.6-pvops_x86_64] cd ..
++xen-vgt.git] cp xen/xen.gz /boot/xen-vgt.gz
++
++<grub config>
++(use vgt_bus/vgt_dev/vgt_fun to define PCI address of GEN hardware)
++(to use PCI serial card, use "console=comN comN=baud,parity,port_base,irq,pci_address")
++(currently only UP dom0 is supported. So need "dom0_max_vcpus=1")
++title Xen-VGT(3.2-rc4+)
++	root (hd0,0)
++	kernel /boot/xen-vgt.gz dom0_max_vcpus=1 dom0_mem=2048M iommu=1 loglvl=all guest_loglvl=all msi=1 conring_size=4M noreboot vgt vgt_bus=0 vgt_dev=2 vgt_fun=0 console=com1 com1=115200,8n1,0x2000,-1,02:00.0 sync_console
++	module /boot/dom0-vgt ro root=/dev/sda1 3 console=hvc0
++	module /boot/initrd-vgt.img
 diff --git a/tools/examples/xmexample.hvm b/tools/examples/xmexample.hvm
 index 96b6cc4..19358a4 100644
 --- a/tools/examples/xmexample.hvm
@@ -71,7 +128,7 @@ index 6641197..09ab9a9 100644
  
  extern unsigned long pci_mem_start, pci_mem_end;
 diff --git a/tools/firmware/hvmloader/pci.c b/tools/firmware/hvmloader/pci.c
-index 627e8cb..767a35c 100644
+index 627e8cb..6b0b02b 100644
 --- a/tools/firmware/hvmloader/pci.c
 +++ b/tools/firmware/hvmloader/pci.c
 @@ -24,6 +24,7 @@
@@ -82,7 +139,17 @@ index 627e8cb..767a35c 100644
  
  #include <xen/memory.h>
  #include <xen/hvm/ioreq.h>
-@@ -111,35 +112,31 @@ void pci_setup(void)
+@@ -36,6 +37,9 @@ unsigned long pci_mem_end = PCI_MEM_END;
+ enum virtual_vga virtual_vga = VGA_none;
+ unsigned long igd_opregion_pgbase = 0;
+ 
++#define VESA_MMIO_RSVD_START 0xe0000000UL
++#define VESA_MMIO_RSVD_END   0xe0130000UL
++
+ void pci_setup(void)
+ {
+     uint8_t is_64bar, using_64bar, bar64_relocate = 0;
+@@ -111,35 +115,31 @@ void pci_setup(void)
          ASSERT((devfn != PCI_ISA_DEVFN) ||
                 ((vendor_id == 0x8086) && (device_id == 0x7000)));
  
@@ -126,7 +193,7 @@ index 627e8cb..767a35c 100644
              }
              break;
          case 0x0680:
-@@ -272,6 +269,13 @@ void pci_setup(void)
+@@ -272,6 +272,13 @@ void pci_setup(void)
              unsigned int,
              hvm_info->low_mem_pgend - (pci_mem_start >> PAGE_SHIFT),
              (1u << 16) - 1);
@@ -140,7 +207,23 @@ index 627e8cb..767a35c 100644
          if ( hvm_info->high_mem_pgend == 0 )
              hvm_info->high_mem_pgend = 1ull << (32 - PAGE_SHIFT);
          hvm_info->low_mem_pgend -= nr_pages;
-@@ -400,6 +404,47 @@ void pci_setup(void)
+@@ -366,6 +373,15 @@ void pci_setup(void)
+         base = (resource->base  + bar_sz - 1) & ~(uint64_t)(bar_sz - 1);
+         bar_data |= (uint32_t)base;
+         bar_data_upper = (uint32_t)(base >> 32);
++
++	/* Skip allocate the reserved range by vesafb */
++	if (resource == &mem_resource && 
++	      (base + bar_sz > VESA_MMIO_RSVD_START) && (base < VESA_MMIO_RSVD_END)) {
++		resource->base = VESA_MMIO_RSVD_END;
++        	base = (resource->base  + bar_sz - 1) & ~(uint64_t)(bar_sz - 1);
++        	bar_data |= (uint32_t)base;
++	}
++
+         base += bar_sz;
+ 
+         if ( (base < resource->base) || (base > resource->max) )
+@@ -400,6 +416,47 @@ void pci_setup(void)
  
      if ( vga_devfn != 256 )
      {
