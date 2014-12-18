@@ -1,14 +1,8 @@
 diff --git a/Config.mk b/Config.mk
-index e4f3424..2e36d1a 100644
+index e4f3424..98143d1 100644
 --- a/Config.mk
 +++ b/Config.mk
-@@ -208,11 +208,13 @@ QEMU_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/qemu-upstream-4.3-testing.g
- SEABIOS_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/seabios.git
- else
- OVMF_UPSTREAM_URL ?= git://xenbits.xen.org/ovmf.git
--QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-4.3-testing.git
-+#QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-4.3-testing.git
-+QEMU_UPSTREAM_URL ?= git://vgt.sh.intel.com/qemu-xen.git
+@@ -212,7 +212,8 @@ QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-4.3-testing.git
  SEABIOS_UPSTREAM_URL ?= git://xenbits.xen.org/seabios.git
  endif
  OVMF_UPSTREAM_REVISION ?= b0855f925c6e2e0b21fbb03fab4b5fb5b6876871
