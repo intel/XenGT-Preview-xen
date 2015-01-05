@@ -39,6 +39,9 @@ uint64_t pci_hi_mem_start = 0, pci_hi_mem_end = 0;
 enum virtual_vga virtual_vga = VGA_none;
 unsigned long igd_opregion_pgbase = 0;
 
+#define VESA_MMIO_RSVD_START 0xe0000000UL
+#define VESA_MMIO_RSVD_END   0xe0130000UL
+
 void pci_setup(void)
 {
     uint8_t is_64bar, using_64bar, bar64_relocate = 0;
@@ -389,6 +392,15 @@ void pci_setup(void)
         base = (resource->base  + bar_sz - 1) & ~(uint64_t)(bar_sz - 1);
         bar_data |= (uint32_t)base;
         bar_data_upper = (uint32_t)(base >> 32);
+
+	/* Skip allocate the reserved range by vesafb */
+	if (resource == &mem_resource &&
+	      (base + bar_sz > VESA_MMIO_RSVD_START) && (base < VESA_MMIO_RSVD_END)) {
+		resource->base = VESA_MMIO_RSVD_END;
+		base = (resource->base  + bar_sz - 1) & ~(uint64_t)(bar_sz - 1);
+		bar_data |= (uint32_t)base;
+	}
+
         base += bar_sz;
 
         if ( (base < resource->base) || (base > resource->max) )
