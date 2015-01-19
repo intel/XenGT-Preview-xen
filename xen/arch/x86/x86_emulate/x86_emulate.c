@@ -205,7 +205,7 @@ static uint8_t twobyte_table[256] = {
     /* 0x60 - 0x6F */
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ImplicitOps|ModRM,
     /* 0x70 - 0x7F */
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ImplicitOps|ModRM,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ImplicitOps|ModRM, ImplicitOps|ModRM,
     /* 0x80 - 0x87 */
     ImplicitOps, ImplicitOps, ImplicitOps, ImplicitOps,
     ImplicitOps, ImplicitOps, ImplicitOps, ImplicitOps,
@@ -4231,6 +4231,7 @@ x86_emulate(
     case 0x6f: /* movq mm/m64,mm */
                /* {,v}movdq{a,u} xmm/m128,xmm */
                /* vmovdq{a,u} ymm/m256,ymm */
+    case 0x7e: /* movd xmm,mm/mm32 */
     case 0x7f: /* movq mm,mm/m64 */
                /* {,v}movdq{a,u} xmm,xmm/m128 */
                /* vmovdq{a,u} ymm,ymm/m256 */
@@ -4247,7 +4248,7 @@ x86_emulate(
                 vcpu_must_have_sse2();
                 stub[0] = 0x66; /* movdqa */
                 get_fpu(X86EMUL_FPU_xmm, &fic);
-                ea.bytes = 16;
+                ea.bytes = (b == 0x7e ? 4 : 16);
                 break;
             case vex_none:
                 if ( b != 0xe7 )
