@@ -49,7 +49,7 @@ struct hvm_ioreq_vcpu {
 };
 
 #define NR_IO_RANGE_TYPES (HVMOP_IO_RANGE_PCI + 1)
-#define MAX_NR_IO_RANGES  256
+#define MAX_NR_IO_RANGES  512
 
 struct hvm_ioreq_server {
     struct list_head       list_entry;
