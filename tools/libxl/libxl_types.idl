@@ -38,6 +38,7 @@ libxl_ms_vm_genid = Builtin("ms_vm_genid", passby=PASS_BY_REFERENCE, check_defau
 #
 
 MemKB = UInt(64, init_val = "LIBXL_MEMKB_DEFAULT", json_gen_fn = "libxl__uint64_gen_json")
+VgtInt = UInt(32, init_val = "0UL")
 
 #
 # Constants / Enumerations
@@ -420,6 +421,12 @@ libxl_domain_build_info = Struct("domain_build_info",[
                                        ("acpi_firmware",    string),
                                        ("nographic",        libxl_defbool),
                                        ("vga",              libxl_vga_interface_info),
+                                       ("vgt",              libxl_defbool),
+                                       ("vgt_low_gm_sz",    VgtInt),
+                                       ("vgt_high_gm_sz",   VgtInt),
+                                       ("vgt_fence_sz",     VgtInt),
+                                       ("vgt_primary",      VgtInt),
+                                       ("vgt_monitor_config_file", string),
                                        ("vnc",              libxl_vnc_info),
                                        # keyboard layout, default is en-us keyboard
                                        ("keymap",           string),

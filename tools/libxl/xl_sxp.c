@@ -110,6 +110,8 @@ void printf_info_sexp(int domid, libxl_domain_config *d_config, FILE *fh)
         fprintf(fh, "\t\t\t(stdvga %s)\n", b_info->u.hvm.vga.kind ==
                                       LIBXL_VGA_INTERFACE_TYPE_STD ?
                                       "True" : "False");
+        fprintf(fh, "\t\t\t(vgt %s)\n",
+               libxl_defbool_to_string(b_info->u.hvm.vgt));
         fprintf(fh, "\t\t\t(vnc %s)\n",
                libxl_defbool_to_string(b_info->u.hvm.vnc.enable));
         fprintf(fh, "\t\t\t(vnclisten %s)\n", b_info->u.hvm.vnc.listen);

@@ -1918,6 +1918,19 @@ skip_vfb:
             b_info->u.hvm.vga.kind = l ? LIBXL_VGA_INTERFACE_TYPE_STD :
                                          LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
 
+        xlu_cfg_get_defbool(config, "vgt", &b_info->u.hvm.vgt, 0);
+        if (!xlu_cfg_get_long(config, "vgt_low_gm_sz", &l, 0))
+            b_info->u.hvm.vgt_low_gm_sz = l;
+        if (!xlu_cfg_get_long(config, "vgt_high_gm_sz", &l, 0))
+            b_info->u.hvm.vgt_high_gm_sz = l;
+        if (!xlu_cfg_get_long(config, "vgt_fence_sz", &l, 0))
+            b_info->u.hvm.vgt_fence_sz = l;
+        if (!xlu_cfg_get_long(config, "vgt_primary", &l, 0))
+            b_info->u.hvm.vgt_primary = l;
+        else
+            b_info->u.hvm.vgt_primary = -1; /* not specified */
+        xlu_cfg_replace_string(config, "vgt_monitor_config_file", &b_info->u.hvm.vgt_monitor_config_file, 0);
+
         xlu_cfg_replace_string (config, "keymap", &b_info->u.hvm.keymap, 0);
         xlu_cfg_get_defbool (config, "spice", &b_info->u.hvm.spice.enable, 0);
         if (!xlu_cfg_get_long (config, "spiceport", &l, 0))
