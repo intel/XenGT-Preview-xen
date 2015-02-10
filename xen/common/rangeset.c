@@ -98,7 +98,7 @@ static struct range *alloc_range(
 {
     struct range *x;
 
-    if ( r->nr_ranges == 0 )
+    if ( !(r->flags & RANGESETF_unlimited) && r->nr_ranges == 0 )
         return NULL;
 
     x = xmalloc(struct range);

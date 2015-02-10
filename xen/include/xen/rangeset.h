@@ -49,6 +49,8 @@ void rangeset_limit(
  /* Pretty-print range limits in hexadecimal. */
 #define _RANGESETF_prettyprint_hex 0
 #define RANGESETF_prettyprint_hex  (1U << _RANGESETF_prettyprint_hex)
+#define _RANGESETF_unlimited 1
+#define RANGESETF_unlimited (1U << _RANGESETF_unlimited)
 
 int __must_check rangeset_is_empty(
     struct rangeset *r);
